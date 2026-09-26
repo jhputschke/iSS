@@ -56,6 +56,14 @@ class FSSW {
     // dN/(dxt dy) for one particle species
     std::vector<double> dN_dxtdy_for_one_particle_species;
 
+    // delta f coefficients of every cell, computed once per surface: they
+    // depend on the cell only, not on the species or the sampled hadron.
+    // cellVisCoeffs_[l*kMaxVisCoeffs_ + i], cellVisCoeffsSize_[l] of them.
+    static const int kMaxVisCoeffs_ = 8;
+    bool cellVisCoeffsReady_ = false;
+    std::vector<double> cellVisCoeffs_;
+    std::vector<unsigned char> cellVisCoeffsSize_;
+
     int number_of_chosen_particles;
 
     // store particle index;
@@ -161,6 +169,11 @@ class FSSW {
     void calculate_dN_dxtdy_for_one_particle_species(const int particle_idx);
     void sample_using_dN_dxtdy_4all_particles_conventional();
 
+    void getCellVisCoefficients(const FO_surf_LRF *surf,
+                                std::vector<double> &visCoefficients);
+    void prepare_cell_visCoefficients();
+    void release_cell_visCoefficients();
+
     void getbulkvisCoefficients(const double Tdec,
                                 std::vector<double> &bulkvisCoefficients);
     void getbulkvisCoefficients(const double Tdec, const double mu_B,
@@ -201,12 +214,12 @@ class FSSW {
         const double mass, const double pdotu, const double bulkPi,
         const double Tdec, const int sign, const int baryon,
         const int strange, const int charge,
-        const double f0, const std::vector<double> bulkvisCoefficients);
+        const double f0, const std::vector<double> &bulkvisCoefficients);
     int sample_momemtum_from_a_fluid_cell(
         const double mass, const int sign,
         const int baryon, const int strange, const int charge,
         const FO_surf_LRF *surf,
-        const std::vector<double> visCoefficients,
+        const std::vector<double> &visCoefficients,
         const double deltaf_qmu_coeff,
         double &pT, double &phi, double &y_minus_eta_s);
     void add_one_sampled_particle(
