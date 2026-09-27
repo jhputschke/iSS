@@ -3,6 +3,9 @@ hydro_mode = 2           # mode for reading in freeze out information
                          # 1: reads outputs from MUSIC assuming
                          #    boost-invariant
                          # 2: reads outputs from MUSIC full (3+1)-d
+hydro_Cartesian = 0      # mode for Milne or Cartesian hydro
+                         # 0: Milne
+                         # 1: Cartesian
 
 afterburner_type = 1     # 0: PDG_Decay
                          # 1: UrQMD
