@@ -110,7 +110,11 @@ void iSS::getSurfaceCellFromJETSCAPE(std::vector<FO_surf> &FOsurf_arr) {
     freeze_out_data.read_in_chemical_potentials(FOsurf_arr, particle_);
     flag_PCE_ = freeze_out_data.get_flag_PCE();
 
-    computeFOSurfTmunu(FOsurf_arr);
+    // the surface's total T^{mu nu} and charges: printed at echoLevel > 0 and
+    // used by perform_checks, otherwise a pass over the surface for nothing
+    if (echoLevel_ > 0 || paraRdr_ptr->getVal("perform_checks", 0) == 1) {
+        computeFOSurfTmunu(FOsurf_arr);
+    }
     if (paraRdr_ptr->getVal("MC_sampling") == 4) {
         freeze_out_data.regulate_surface_cells(FOsurf_arr);
         transform_to_local_rest_frame(FOsurf_arr, FOsurf_LRF_array_);
@@ -221,6 +225,7 @@ void iSS::transform_to_local_rest_frame(
     if (echoLevel_ > 0) {
         messager.info("Transforming fluid cells to their local rest frame ...");
     }
+    FOsurf_LRF_ptr.reserve(FOsurf_ptr.size());
     for (auto &surf_i: FOsurf_ptr) {
         FO_surf_LRF surf_LRF_i;
         surf_LRF_i.tau = surf_i.tau;

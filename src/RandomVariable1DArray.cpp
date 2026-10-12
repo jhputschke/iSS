@@ -29,16 +29,37 @@ RandomVariable1DArray::RandomVariable1DArray(vector<double> *data_in,
     // get data info
     data_size = data_in->size();
 
-    ran_gen_ptr = ran_gen;
+    ran_gen_ = ran_gen.get();
 
     // allocate memory
     invCDF = new vector<double>(data_size+1, zero);
+    owns_invCDF_ = true;
 
+    build(data_in->data(), zero);
+}
+
+
+//----------------------------------------------------------------------
+RandomVariable1DArray::RandomVariable1DArray(const double *data, long n,
+                std::shared_ptr<RandomUtil::Random> ran_gen,
+                vector<double> &storage, double zero) {
+    data_size = n;
+    ran_gen_ = ran_gen.get();
+    storage.resize(data_size+1);
+    invCDF = &storage;
+    owns_invCDF_ = false;
+
+    build(data, zero);
+}
+
+
+//----------------------------------------------------------------------
+void RandomVariable1DArray::build(const double *data, double zero) {
     // generate inverse CDF
     data_sum = 0.0;
     (*invCDF)[0] = 0.0;
     for (long l = 0; l < data_size; l++) {
-        double val = (*data_in)[l];
+        double val = data[l];
       
         // enforce positiveness
         if (val<zero) val = zero;
@@ -48,14 +69,13 @@ RandomVariable1DArray::RandomVariable1DArray(vector<double> *data_in,
         // copy to inverse CDF
         (*invCDF)[l+1] = data_sum;
     }
-
 }
 
 
 //----------------------------------------------------------------------
 RandomVariable1DArray::~RandomVariable1DArray()
 {
-  delete invCDF;
+  if (owns_invCDF_) delete invCDF;
 }
 
 
@@ -63,7 +83,7 @@ RandomVariable1DArray::~RandomVariable1DArray()
 long RandomVariable1DArray::rand() {
 // Sample according to inverse CDF, which gives a (left, right) pair.
     return binarySearch(invCDF,
-                        (*invCDF)[0]+(data_sum-(*invCDF)[0]-1e-15)*ran_gen_ptr.lock()->rand_uniform());
+                        (*invCDF)[0]+(data_sum-(*invCDF)[0]-1e-15)*ran_gen_->rand_uniform());
 }
 
 //----------------------------------------------------------------------

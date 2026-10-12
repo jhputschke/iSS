@@ -9,15 +9,24 @@
 class RandomVariable1DArray {
  private:
     std::vector<double>* invCDF;
+    bool owns_invCDF_;
     long data_size;
     //double data_zero;
     double data_sum; // "tolerance zero value", max and sum
-    std::weak_ptr<RandomUtil::Random> ran_gen_ptr;
+    RandomUtil::Random *ran_gen_;   // the owner outlives this object
+
+    void build(const double *data, double zero);
 
  public:
     RandomVariable1DArray(std::vector<double>*,
                           std::shared_ptr<RandomUtil::Random> ran_gen,
                           double=1e-30);
+    //! the inverse CDF in storage the caller owns and reuses from one
+    //! species to the next, instead of allocating (and page-faulting) a
+    //! new array of one double per cell every time
+    RandomVariable1DArray(const double *data, long n,
+                          std::shared_ptr<RandomUtil::Random> ran_gen,
+                          std::vector<double> &storage, double=1e-30);
     ~RandomVariable1DArray();
     long rand();
     double return_sum();

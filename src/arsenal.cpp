@@ -666,12 +666,13 @@ long binarySearch(vector<double>* A, double value, bool skip_out_of_range)
       exit(-1);
    }
    idx = static_cast<int>(floor((idx_f+idx_i)/2.));
+   const double *data = A->data();
    while((idx_f-idx_i) > 1)
    {
-     if((*A)[idx] < value)
-        idx_i = idx;
-     else
-        idx_f = idx;
+     // the same bisection, as selects: the branch is unpredictable
+     const bool go_right = (data[idx] < value);
+     idx_i = go_right ? idx : idx_i;
+     idx_f = go_right ? idx_f : idx;
      idx = static_cast<int>(floor((idx_f+idx_i)/2.));
    }
    return(idx_i);

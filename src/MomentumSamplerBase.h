@@ -28,6 +28,11 @@ class MomentumSamplerBase {
     std::vector<double> CDF_1_;
     std::vector<double> CDF_2_;
 
+    //! the combined CDF of the current (m_tilde, mu_tilde): what inverse_CDF
+    //! evaluated from the three tables at every bisection step
+    std::vector<double> CDFc_;
+    double CDFc_m_tilde_, CDFc_mu_tilde_, CDFc_m_minus_mu_tilde_;
+
     MomentumSamplerBase();
     virtual ~MomentumSamplerBase() {};
 
@@ -36,11 +41,13 @@ class MomentumSamplerBase {
     virtual double CDF_2(const double Etilde) const {return(0.0*Etilde);}
 
     void update_cache(const double m_minus_mu_tilde);
+    void update_combined_CDF(const double m_tilde, const double mu_tilde,
+                             const double m_term);
 
     double Sample_a_momentum(double m, double T, double mu);
 
     double inverse_CDF(const double r, const int idx_0,
-                       const double CDF_max, const double m_term,
+                       const double CDF_max,
                        const double m_tilde, const double mu_tilde) const;
 
 };

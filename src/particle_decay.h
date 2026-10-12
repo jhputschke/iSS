@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <unordered_map>
 
 #include "data_struct.h"
 #include "Random.h"
@@ -14,7 +15,15 @@ class particle_decay {
     const std::string table_path_;
     const AfterburnerType afterburner_type_;
     std::vector<particle_info*> resonance_table;
+    //! the table entry of a Monte Carlo id (the first one, as a search of
+    //! the table from the front would find)
+    std::unordered_map<int, particle_info*> resonance_by_pid_;
     std::shared_ptr<RandomUtil::Random> ran_gen_ptr;
+
+    particle_info* find_resonance(const int monval) const {
+        auto it = resonance_by_pid_.find(monval);
+        return (it == resonance_by_pid_.end()) ? nullptr : it->second;
+    }
 
  public:
     particle_decay(std::shared_ptr<RandomUtil::Random> ran_gen,

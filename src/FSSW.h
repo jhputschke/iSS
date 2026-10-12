@@ -65,6 +65,27 @@ class FSSW {
     std::vector<double> cellVisCoeffs_;
     std::vector<unsigned char> cellVisCoeffsSize_;
 
+    // what the yield loop reads of every cell, packed once per surface
+    // (prepare_cell_yield_inputs): the loop streams every cell once per
+    // block of species and is bound by memory traffic, and FO_surf_LRF is
+    // 168 bytes per cell for the 24 it needs
+    bool cellYieldInputsReady_ = false;
+    std::vector<float> cell_dsigma_u_, cell_T_;
+    std::vector<float> cell_muB_, cell_muS_, cell_muQ_, cell_bulkPi_;
+    // diffusion delta f only
+    std::vector<double> cell_dsigma_q_, cell_qmu_coeff_, cell_prefactor_qmu_;
+
+    // the yields of a block of species from one pass over the cells,
+    // dN_block_[s*FO_length + l]
+    static const int kSpeciesBlock_ = 8;
+    std::vector<double> dN_block_;
+
+    // the inverse CDF over the cells, reused from species to species
+    std::vector<double> invCDF_storage_;
+
+    // the decay chain of one primary (decay_one_primary), reused
+    std::vector<iSS_Hadron> decay_chain_, decay_daughters_;
+
     // correlated sampling (correlated_sampling = 1): the random numbers are
     // addressed by the physical cell, not by the order of the draws, so two
     // surfaces that agree in a region give the same hadrons there. Cells are
@@ -179,11 +200,17 @@ class FSSW {
     // the following variables need to be set first in order to
     // call this function
     void calculate_dN_dxtdy_for_one_particle_species(const int particle_idx);
+    void calculate_dN_dxtdy_for_species_block(
+                const std::vector<int> &species_idx,
+                double *__restrict__ dN_out);
     void sample_using_dN_dxtdy_4all_particles_conventional();
+    void sample_one_species_conventional(const int real_particle_idx,
+                                         const double *dN_cell);
 
     void prepare_cell_blocks();
     void release_cell_blocks();
-    void sample_one_species_correlated(const int real_particle_idx);
+    void sample_one_species_correlated(const int real_particle_idx,
+                                       const double *dN_cell);
     void decay_one_primary(const iSS_Hadron &primary,
                            std::vector<iSS_Hadron> &sample);
 
@@ -191,6 +218,8 @@ class FSSW {
                                 std::vector<double> &visCoefficients);
     void prepare_cell_visCoefficients();
     void release_cell_visCoefficients();
+    void prepare_cell_yield_inputs();
+    void release_cell_yield_inputs();
 
     void getbulkvisCoefficients(const double Tdec,
                                 std::vector<double> &bulkvisCoefficients);
@@ -232,12 +261,12 @@ class FSSW {
         const double mass, const double pdotu, const double bulkPi,
         const double Tdec, const int sign, const int baryon,
         const int strange, const int charge,
-        const double f0, const std::vector<double> &bulkvisCoefficients);
+        const double f0, const double *bulkvisCoefficients);
     int sample_momemtum_from_a_fluid_cell(
         const double mass, const int sign,
         const int baryon, const int strange, const int charge,
         const FO_surf_LRF *surf,
-        const std::vector<double> &visCoefficients,
+        const double *visCoefficients,
         const double deltaf_qmu_coeff,
         double &pT, double &phi, double &y_minus_eta_s);
     iSS_Hadron make_sampled_particle(

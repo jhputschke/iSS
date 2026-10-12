@@ -167,6 +167,8 @@ int particle_decay::read_resonances_list() {
         } else {
             resonance_table[i]->sign = 1;
         }
+        resonance_by_pid_.emplace(resonance_table[i]->monval,
+                                  resonance_table[i]);
     }
     return(Nparticle);
 }
@@ -201,76 +203,40 @@ void particle_decay::check_resonance_table() {
 
 //! This function returns particle width in GeV
 double particle_decay::get_particle_width(iSS_Hadron *part) {
-    double width = 0.0;
-    for (unsigned int i = 0; i < resonance_table.size(); i++) {
-        if (part->pid == resonance_table[i]->monval) {
-            width = resonance_table[i]->width;
-            break;
-        }
-    }
-    return(width);
+    const particle_info *reso = find_resonance(part->pid);
+    return (reso != nullptr) ? reso->width : 0.0;
 }
 
 //! This function checks whether the particle is stable
 int particle_decay::check_particle_stable(iSS_Hadron *part) {
-    int stable = 0;
-    for (unsigned int i = 0; i < resonance_table.size(); i++) {
-        if (part->pid == resonance_table[i]->monval) {
-            stable = resonance_table[i]->stable;
-            break;
-        }
-    }
-    return(stable);
+    const particle_info *reso = find_resonance(part->pid);
+    return (reso != nullptr) ? reso->stable : 0;
 }
 
 
 //! This function returns the electric charge of particle
 int particle_decay::get_particle_charge(int monval) {
-    int charge = 0;
-    for (unsigned int i = 0; i < resonance_table.size(); i++) {
-        if (monval == resonance_table[i]->monval) {
-            charge = resonance_table[i]->charge;
-            break;
-        }
-    }
-    return(charge);
+    const particle_info *reso = find_resonance(monval);
+    return (reso != nullptr) ? reso->charge : 0;
 }
 
 //! This function returns the baryon number of particle
 int particle_decay::get_particle_baryon_number(int monval) {
-    int baryon = 0;
-    for (unsigned int i = 0; i < resonance_table.size(); i++) {
-        if (monval == resonance_table[i]->monval) {
-            baryon = resonance_table[i]->baryon;
-            break;
-        }
-    }
-    return(baryon);
+    const particle_info *reso = find_resonance(monval);
+    return (reso != nullptr) ? reso->baryon : 0;
 }
 
 //! This function returns the strange number of particle
 int particle_decay::get_particle_strange_number(int monval) {
-    int strange = 0;
-    for (unsigned int i = 0; i < resonance_table.size(); i++) {
-        if (monval == resonance_table[i]->monval) {
-            strange = resonance_table[i]->strange;
-            break;
-        }
-    }
-    return(strange);
+    const particle_info *reso = find_resonance(monval);
+    return (reso != nullptr) ? reso->strange : 0;
 }
 
 
 //! This is a shell function to perform resonance decays
 void particle_decay::perform_decays(
             iSS_Hadron *mother, vector<iSS_Hadron>* daughter_list) {
-    particle_info* mother_decay_info = NULL;
-    for (unsigned int i = 0; i < resonance_table.size(); i++) {
-        if (mother->pid == resonance_table[i]->monval) {
-            mother_decay_info = resonance_table[i];
-            break;
-        }
-    }
+    particle_info* mother_decay_info = find_resonance(mother->pid);
     if (mother_decay_info->stable == 1) {
         // the particle is a stable particle
         daughter_list->push_back(*mother);
@@ -290,59 +256,44 @@ void particle_decay::perform_decays(
     }
     int N_decay_part = picked_channel->decay_Npart;
     if (N_decay_part == 2) {
-        iSS_Hadron *daughter1 = new iSS_Hadron;
-        iSS_Hadron *daughter2 = new iSS_Hadron;
+        iSS_Hadron daughter1, daughter2;
         int decay_part1_monval = picked_channel->decay_part[0];
         int decay_part2_monval = picked_channel->decay_part[1];
-        daughter1->pid = decay_part1_monval;
-        daughter2->pid = decay_part2_monval;
-        daughter1->mass = get_particle_mass(decay_part1_monval);
-        daughter2->mass = get_particle_mass(decay_part2_monval);
-        perform_two_body_decay(mother, daughter1, daughter2);
-        daughter_list->push_back(*daughter1);
-        daughter_list->push_back(*daughter2);
-        delete daughter1;
-        delete daughter2;
+        daughter1.pid = decay_part1_monval;
+        daughter2.pid = decay_part2_monval;
+        daughter1.mass = get_particle_mass(decay_part1_monval);
+        daughter2.mass = get_particle_mass(decay_part2_monval);
+        perform_two_body_decay(mother, &daughter1, &daughter2);
+        daughter_list->push_back(daughter1);
+        daughter_list->push_back(daughter2);
     } else if (N_decay_part == 3) {
-        iSS_Hadron *daughter1 = new iSS_Hadron;
-        iSS_Hadron *daughter2 = new iSS_Hadron;
-        iSS_Hadron *daughter3 = new iSS_Hadron;
+        iSS_Hadron daughter1, daughter2, daughter3;
         int decay_part1_monval = picked_channel->decay_part[0];
         int decay_part2_monval = picked_channel->decay_part[1];
         int decay_part3_monval = picked_channel->decay_part[2];
-        daughter1->pid = decay_part1_monval;
-        daughter2->pid = decay_part2_monval;
-        daughter3->pid = decay_part3_monval;
-        daughter1->mass = get_particle_mass(decay_part1_monval);
-        daughter2->mass = get_particle_mass(decay_part2_monval);
-        daughter3->mass = get_particle_mass(decay_part3_monval);
-        perform_three_body_decay(mother, daughter1, daughter2, daughter3);
-        daughter_list->push_back(*daughter1);
-        daughter_list->push_back(*daughter2);
-        daughter_list->push_back(*daughter3);
-        delete daughter1;
-        delete daughter2;
-        delete daughter3;
+        daughter1.pid = decay_part1_monval;
+        daughter2.pid = decay_part2_monval;
+        daughter3.pid = decay_part3_monval;
+        daughter1.mass = get_particle_mass(decay_part1_monval);
+        daughter2.mass = get_particle_mass(decay_part2_monval);
+        daughter3.mass = get_particle_mass(decay_part3_monval);
+        perform_three_body_decay(mother, &daughter1, &daughter2, &daughter3);
+        daughter_list->push_back(daughter1);
+        daughter_list->push_back(daughter2);
+        daughter_list->push_back(daughter3);
     }
 }
 
 //! This function returns the particle mass for a given particle id
 double particle_decay::get_particle_mass(int POI_monval) {
-    double mass = 0.0;
-    unsigned int ipart = 0;
-    for (ipart = 0; ipart < resonance_table.size(); ipart++) {
-        if (POI_monval == resonance_table[ipart]->monval) {
-            mass = resonance_table[ipart]->mass;
-            break;
-        }
-    }
-    if (ipart == resonance_table.size() && mass < 1e-10) {
+    const particle_info *reso = find_resonance(POI_monval);
+    if (reso == nullptr) {
         cout << "[Error]:particle_decay::get_particle_mass(): "
              << "Can not find particle with monval = " << POI_monval
              << endl;
         exit(1);
     }
-    return(mass);
+    return(reso->mass);
 }
 
 //! This function perform two body decay

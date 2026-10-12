@@ -758,6 +758,64 @@ void FSSW::release_cell_visCoefficients() {
 }
 
 
+void FSSW::prepare_cell_yield_inputs() {
+// Pack what the yield loop reads of every cell into arrays of their own.
+// The loop streams every cell once per block of species and is bound by
+// memory traffic: FO_surf_LRF is 168 bytes per cell, the loop reads 24.
+    cell_dsigma_u_.resize(FO_length);
+    cell_T_.resize(FO_length);
+    cell_muB_.resize(FO_length);
+    cell_muS_.resize(FO_length);
+    cell_muQ_.resize(FO_length);
+    cell_bulkPi_.resize(FO_length);
+    if (bINCLUDE_DIFFUSION_DELTAF) {
+        cell_dsigma_q_.resize(FO_length);
+        cell_qmu_coeff_.resize(FO_length);
+        cell_prefactor_qmu_.resize(FO_length);
+    }
+    #pragma omp parallel for schedule(static)
+    for (long l = 0; l < FO_length; l++) {
+        const FO_surf_LRF &surf = FOsurf_ptr[l];
+        cell_dsigma_u_[l] = surf.da_mu_LRF[0];
+        cell_T_[l]        = surf.Tdec;
+        cell_muB_[l]      = surf.muB;
+        cell_muS_[l]      = surf.muS;
+        cell_muQ_[l]      = surf.muQ;
+        cell_bulkPi_[l]   = surf.bulkPi;
+        if (bINCLUDE_DIFFUSION_DELTAF) {
+            // the expressions the yield loop evaluated per cell
+            cell_dsigma_q_[l] = (  surf.qmuLRF_x*surf.da_mu_LRF[1]
+                                 + surf.qmuLRF_y*surf.da_mu_LRF[2]
+                                 + surf.qmuLRF_z*surf.da_mu_LRF[3]);
+            const double temp = surf.Tdec;
+            const double mu_B = surf.muB;
+            cell_qmu_coeff_[l] = get_deltaf_qmu_coeff(temp, mu_B);
+            double rho_B = surf.Bn;
+            double Edec = surf.Edec;
+            double Pdec = surf.Pdec;
+            cell_prefactor_qmu_[l] = rho_B/(Edec + Pdec);  // 1/GeV
+        }
+    }
+    cellYieldInputsReady_ = true;
+}
+
+
+void FSSW::release_cell_yield_inputs() {
+    cellYieldInputsReady_ = false;
+    std::vector<float>().swap(cell_dsigma_u_);
+    std::vector<float>().swap(cell_T_);
+    std::vector<float>().swap(cell_muB_);
+    std::vector<float>().swap(cell_muS_);
+    std::vector<float>().swap(cell_muQ_);
+    std::vector<float>().swap(cell_bulkPi_);
+    std::vector<double>().swap(cell_dsigma_q_);
+    std::vector<double>().swap(cell_qmu_coeff_);
+    std::vector<double>().swap(cell_prefactor_qmu_);
+    std::vector<double>().swap(dN_block_);
+    std::vector<double>().swap(invCDF_storage_);
+}
+
+
 //***************************************************************************
 void FSSW::calculate_dN_dxtdy_for_one_particle_species(
                                                 const int real_particle_idx) {
@@ -774,23 +832,47 @@ void FSSW::calculate_dN_dxtdy_for_one_particle_species(
    Note that here m and mu represent in fact m/T and mu/T so they are
    unitless.
 */
+    const std::vector<int> species_idx(1, real_particle_idx);
+    calculate_dN_dxtdy_for_species_block(
+                    species_idx, dN_dxtdy_for_one_particle_species.data());
+}
+
+
+void FSSW::calculate_dN_dxtdy_for_species_block(
+        const std::vector<int> &species_idx, double *__restrict__ dN_out) {
+// dN/(dxt dy) in every cell for a block of species, dN_out[s*FO_length + l],
+// from one pass over the cells. Per (cell, species) the arithmetic is that
+// of one species at a time; the cells' data is read once per block instead
+// of once per species, and that traffic is what bounded this loop. (dN_out
+// aliases nothing the loop reads, so the species of a cell can overlap.)
     Stopwatch sw;
     sw.tic();
 
     const bool cached_coeffs = cellVisCoeffsReady_;
+    const bool packed_inputs = cellYieldInputsReady_;
+    const int n_species = static_cast<int>(species_idx.size());
 
     // now loop over all freeze-out cells and particles
     const double unit_factor = 1.0/pow(hbarC, 3);  // unit: convert to unitless
 
-    const particle_info *particle = &particles[real_particle_idx];
-    const int degen = particle->gspin;
-    const int baryon  = particle->baryon;
-    const int strange = particle->strange;
-    const int charge  = particle->charge;
-    const double mass = particle->mass;
-    const double prefactor = degen/(2.*M_PI*M_PI);
+    struct SpeciesConst {
+        const particle_info *particle;
+        int baryon, strange, charge;
+        double mass, prefactor;
+    };
+    std::vector<SpeciesConst> species(n_species);
+    for (int s = 0; s < n_species; s++) {
+        const particle_info *particle = &particles[species_idx[s]];
+        const int degen = particle->gspin;
+        species[s].particle  = particle;
+        species[s].baryon    = particle->baryon;
+        species[s].strange   = particle->strange;
+        species[s].charge    = particle->charge;
+        species[s].mass      = particle->mass;
+        species[s].prefactor = degen/(2.*M_PI*M_PI);
+    }
 
-    // Every cell writes only its own dN_dxtdy element, so the cells can be
+    // Every cell writes only its own dN_dxtdy elements, so the cells can be
     // done in parallel with the same arithmetic per cell as the serial loop.
     #pragma omp parallel
     {
@@ -798,19 +880,37 @@ void FSSW::calculate_dN_dxtdy_for_one_particle_species(
 
     // calculate_dN_analytic depends on (mu, T) only for a given species, and
     // an isothermal surface has long runs of cells with the same (mu, T):
-    // reuse the last result when both are exactly the same
-    double last_mu = std::numeric_limits<double>::quiet_NaN();
-    double last_temp = std::numeric_limits<double>::quiet_NaN();
-    std::array<double, 6> results_ptr = {0.0};
+    // reuse the last result when both are exactly the same (per species)
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<double> last_mu(n_species, nan);
+    std::vector<double> last_temp(n_species, nan);
+    std::vector<std::array<double, 6>> results(n_species);
+    for (auto &r : results) r.fill(0.0);
 
     // loop over all the fluid cells
     #pragma omp for schedule(static)
     for (long l = 0; l < FO_length; l++) {
         const FO_surf_LRF* surf = &FOsurf_ptr[l];
-        const double temp = surf->Tdec;
-        const double mu_B = surf->muB;
+        float Tdec, muB, muS, muQ, bulkPi_cell, dsigma_u_cell;
+        if (packed_inputs) {
+            Tdec          = cell_T_[l];
+            muB           = cell_muB_[l];
+            muS           = cell_muS_[l];
+            muQ           = cell_muQ_[l];
+            bulkPi_cell   = cell_bulkPi_[l];
+            dsigma_u_cell = cell_dsigma_u_[l];
+        } else {
+            Tdec          = surf->Tdec;
+            muB           = surf->muB;
+            muS           = surf->muS;
+            muQ           = surf->muQ;
+            bulkPi_cell   = surf->bulkPi;
+            dsigma_u_cell = surf->da_mu_LRF[0];
+        }
+        const double temp = Tdec;
+        const double mu_B = muB;
 
-        double dsigma_dot_u = surf->da_mu_LRF[0];
+        double dsigma_dot_u = dsigma_u_cell;
 
         // delta f coefficients
         const double *visCoefficients;
@@ -825,14 +925,14 @@ void FSSW::calculate_dN_dxtdy_for_one_particle_species(
         double bulkPi = 0.0;
         if (bINCLUDE_BULK_DELTAF) {
             if (bulk_deltaf_kind_ == 21 || bulk_deltaf_kind_ == 20) {
-                bulkPi = surf->bulkPi;    // GeV/fm^3
+                bulkPi = bulkPi_cell;    // GeV/fm^3
             } else if (bulk_deltaf_kind_ == 11) {
-                bulkPi = surf->bulkPi;    // GeV/fm^3
+                bulkPi = bulkPi_cell;    // GeV/fm^3
             } else {
                 if (bulk_deltaf_kind_ == 0) {
-                    bulkPi = surf->bulkPi;        // unit in GeV/fm^3
+                    bulkPi = bulkPi_cell;        // unit in GeV/fm^3
                 } else {
-                    bulkPi = surf->bulkPi/hbarC;  // unit in fm^-4
+                    bulkPi = bulkPi_cell/hbarC;  // unit in fm^-4
                 }
             }
         }
@@ -842,89 +942,105 @@ void FSSW::calculate_dN_dxtdy_for_one_particle_species(
         double deltaf_qmu_coeff = 1.0;
         double prefactor_qmu = 0.0;
         if (bINCLUDE_DIFFUSION_DELTAF) {
-            dsigma_dot_q = (  surf->qmuLRF_x*surf->da_mu_LRF[1]
-                            + surf->qmuLRF_y*surf->da_mu_LRF[2]
-                            + surf->qmuLRF_z*surf->da_mu_LRF[3]);
+            if (packed_inputs) {
+                dsigma_dot_q = cell_dsigma_q_[l];
+                deltaf_qmu_coeff = cell_qmu_coeff_[l];
+                prefactor_qmu = cell_prefactor_qmu_[l];
+            } else {
+                dsigma_dot_q = (  surf->qmuLRF_x*surf->da_mu_LRF[1]
+                                + surf->qmuLRF_y*surf->da_mu_LRF[2]
+                                + surf->qmuLRF_z*surf->da_mu_LRF[3]);
 
-            deltaf_qmu_coeff = get_deltaf_qmu_coeff(temp, mu_B);
+                deltaf_qmu_coeff = get_deltaf_qmu_coeff(temp, mu_B);
 
-            double rho_B = surf->Bn;
-            double Edec = surf->Edec;
-            double Pdec = surf->Pdec;
-            prefactor_qmu = rho_B/(Edec + Pdec);  // 1/GeV
-        }
-
-        // calculate dN / (dxt dy) for all particles
-        double total_N = 0;
-
-        double mu = baryon*surf->muB + strange*surf->muS + charge*surf->muQ;
-        if (flag_PCE_ == 1) {
-            double mu_PCE = surf->particle_mu_PCE[real_particle_idx];
-            mu += mu_PCE;
-        }
-
-        // calculate dN / (dxt dy)
-        if (!(mu == last_mu && temp == last_temp)) {
-            calculate_dN_analytic(particle, mu, temp, results_ptr);
-            last_mu = mu;
-            last_temp = temp;
-        }
-
-        double N_eq = unit_factor*prefactor*dsigma_dot_u*results_ptr[0];
-
-        double deltaN_bulk = 0.0;
-        if (bINCLUDE_BULK_DELTAF) {
-            if (bulk_deltaf_kind_ == 1) {
-                deltaN_bulk = (unit_factor*prefactor*dsigma_dot_u
-                               *(- bulkPi*visCoefficients[0])
-                               *(- visCoefficients[1]*results_ptr[1]
-                                 + results_ptr[2]));
-            } else if (bulk_deltaf_kind_ == 11) {
-                deltaN_bulk = (
-                    unit_factor*prefactor*dsigma_dot_u*bulkPi
-                    *(  results_ptr[1]*mass*mass*visCoefficients[0]
-                      + results_ptr[2]*baryon*visCoefficients[1]
-                      + results_ptr[3]*visCoefficients[2]));
-            } else if (bulk_deltaf_kind_ == 21) {
-                // WSU Chapman-Enskog for NEoS BQS
-                deltaN_bulk = (unit_factor*prefactor*dsigma_dot_u
-                               *(- bulkPi*visCoefficients[0])
-                               *(- visCoefficients[1]*results_ptr[1]
-                                 + results_ptr[2]));
-            } else if (bulk_deltaf_kind_ == 20) {
-                // WSU 22-mom for NEoS BQS
-                deltaN_bulk = (unit_factor*prefactor*dsigma_dot_u*bulkPi
-                    *(  results_ptr[1]*mass*mass*visCoefficients[2]
-                      + results_ptr[2]*(  baryon*visCoefficients[3]
-                                        + strange*visCoefficients[4]
-                                        + charge*visCoefficients[5])
-                      + results_ptr[3]*(  visCoefficients[1]
-                                        - visCoefficients[2]))
-                );
+                double rho_B = surf->Bn;
+                double Edec = surf->Edec;
+                double Pdec = surf->Pdec;
+                prefactor_qmu = rho_B/(Edec + Pdec);  // 1/GeV
             }
         }
 
-        double deltaN_qmu = 0.0;
-        if (bINCLUDE_DIFFUSION_DELTAF) {
-            deltaN_qmu = (unit_factor*prefactor
-                          *dsigma_dot_q/deltaf_qmu_coeff
-                          *(- prefactor_qmu*results_ptr[4]
-                            - baryon*results_ptr[5]));
-        }
+        for (int s = 0; s < n_species; s++) {
+            const particle_info *particle = species[s].particle;
+            const int baryon  = species[s].baryon;
+            const int strange = species[s].strange;
+            const int charge  = species[s].charge;
+            const double mass = species[s].mass;
+            const double prefactor = species[s].prefactor;
+            std::array<double, 6> &results_ptr = results[s];
 
-        total_N = N_eq + deltaN_bulk + deltaN_qmu;
-        if (flagRegVisYield_) {
-            total_N = std::min(2.*N_eq, total_N);
-        }
+            // calculate dN / (dxt dy) for all particles
+            double total_N = 0;
 
-        dN_dxtdy_for_one_particle_species[l] = std::max(0., total_N);
+            double mu = baryon*muB + strange*muS + charge*muQ;
+            if (flag_PCE_ == 1) {
+                double mu_PCE = surf->particle_mu_PCE[species_idx[s]];
+                mu += mu_PCE;
+            }
+
+            // calculate dN / (dxt dy)
+            if (!(mu == last_mu[s] && temp == last_temp[s])) {
+                calculate_dN_analytic(particle, mu, temp, results_ptr);
+                last_mu[s] = mu;
+                last_temp[s] = temp;
+            }
+
+            double N_eq = unit_factor*prefactor*dsigma_dot_u*results_ptr[0];
+
+            double deltaN_bulk = 0.0;
+            if (bINCLUDE_BULK_DELTAF) {
+                if (bulk_deltaf_kind_ == 1) {
+                    deltaN_bulk = (unit_factor*prefactor*dsigma_dot_u
+                                   *(- bulkPi*visCoefficients[0])
+                                   *(- visCoefficients[1]*results_ptr[1]
+                                     + results_ptr[2]));
+                } else if (bulk_deltaf_kind_ == 11) {
+                    deltaN_bulk = (
+                        unit_factor*prefactor*dsigma_dot_u*bulkPi
+                        *(  results_ptr[1]*mass*mass*visCoefficients[0]
+                          + results_ptr[2]*baryon*visCoefficients[1]
+                          + results_ptr[3]*visCoefficients[2]));
+                } else if (bulk_deltaf_kind_ == 21) {
+                    // WSU Chapman-Enskog for NEoS BQS
+                    deltaN_bulk = (unit_factor*prefactor*dsigma_dot_u
+                                   *(- bulkPi*visCoefficients[0])
+                                   *(- visCoefficients[1]*results_ptr[1]
+                                     + results_ptr[2]));
+                } else if (bulk_deltaf_kind_ == 20) {
+                    // WSU 22-mom for NEoS BQS
+                    deltaN_bulk = (unit_factor*prefactor*dsigma_dot_u*bulkPi
+                        *(  results_ptr[1]*mass*mass*visCoefficients[2]
+                          + results_ptr[2]*(  baryon*visCoefficients[3]
+                                            + strange*visCoefficients[4]
+                                            + charge*visCoefficients[5])
+                          + results_ptr[3]*(  visCoefficients[1]
+                                            - visCoefficients[2]))
+                    );
+                }
+            }
+
+            double deltaN_qmu = 0.0;
+            if (bINCLUDE_DIFFUSION_DELTAF) {
+                deltaN_qmu = (unit_factor*prefactor
+                              *dsigma_dot_q/deltaf_qmu_coeff
+                              *(- prefactor_qmu*results_ptr[4]
+                                - baryon*results_ptr[5]));
+            }
+
+            total_N = N_eq + deltaN_bulk + deltaN_qmu;
+            if (flagRegVisYield_) {
+                total_N = std::min(2.*N_eq, total_N);
+            }
+
+            dN_out[s*FO_length + l] = std::max(0., total_N);
+        }
     }
     }   // omp parallel
 
     sw.toc();
     if (AMOUNT_OF_OUTPUT > 2) {
         cout << endl
-             << " -- calculate_dN_dxtdy_for_one_particle_species finished in "
+             << " -- calculate_dN_dxtdy_for_species_block finished in "
              << sw.takeTime() << " seconds." << endl;
     }
 }
@@ -1097,15 +1213,14 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
                 " Function sample_using_dN_dxtdy_4all_particles started...");
     }
 
-    std::vector<double> visCoefficients;
     prepare_cell_visCoefficients();
+    prepare_cell_yield_inputs();
     if (correlated_sampling_) {
         prepare_cell_blocks();
     }
 
     // control variables
     int sampling_model    = paraRdr->getVal("dN_dy_sampling_model");
-    double sampling_para1 = paraRdr->getVal("dN_dy_sampling_para1");
 
     int flag_sample_upto_desired_particle_number = paraRdr->getVal(
                                     "sample_upto_desired_particle_number");
@@ -1131,9 +1246,6 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
     }
 
     // use "conventional" sampling
-    // reusable variables
-    // dN_dxtdy for 1 particle
-    //vector<double> dN_dxtdy_single_particle(FO_length, 0);
     if (echoLevel_ > 0) {
         messager_ << "Sampling using dN/dy with "
                   << "sample_using_dN_dxtdy_4all_particles function.";
@@ -1142,151 +1254,54 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
                   << number_of_repeated_sampling;
         messager_.flush("info");
     }
+
+    // The species in blocks: one pass over the cells gives the yields of a
+    // whole block, then its species are sampled one after the other, so the
+    // random draws come in the same order as with one species at a time.
+    std::vector<int> block_species, block_n;
     for (int n = 0; n < number_of_chosen_particles; n++) {
         int real_particle_idx = chosen_particles_sampling_table[n];
         const particle_info *particle = &particles[real_particle_idx];
-        const double mass = particle->mass;
-        const int sign    = particle->sign;
-        const int baryon  = particle->baryon;
-        const int strange = particle->strange;
-        const int charge  = particle->charge;
-        if (echoLevel_ > 0) {
-            messager_ << "Index: " << n << ", Name: " << particle->name
-                 << ", Monte-carlo index: " << particle->monval;
-            messager_.flush("info");
-        }
-        if (local_charge_conservation == 1) {
-            if (particle->charge < 0) {
-                if (echoLevel_ > 0) {
-                    messager_ << "local charge conservation is turn on~ "
-                              << "Skip the negative charge particles.";
-                    messager_.flush("info");
-                }
-                continue;
+        if (local_charge_conservation == 1 && particle->charge < 0) {
+            if (echoLevel_ > 0) {
+                messager_ << "local charge conservation is turn on~ "
+                          << "Skip the negative charge particles.";
+                messager_.flush("info");
             }
+        } else {
+            block_species.push_back(real_particle_idx);
+            block_n.push_back(n);
         }
-
-        calculate_dN_dxtdy_for_one_particle_species(real_particle_idx);
-
-        if (correlated_sampling_) {
-            sample_one_species_correlated(real_particle_idx);
+        const bool block_full = (
+            static_cast<int>(block_species.size()) >= kSpeciesBlock_);
+        if (block_species.empty()
+            || (!block_full && n < number_of_chosen_particles - 1)) {
             continue;
         }
 
-        // prepare the inverse CDF
-        RandomVariable1DArray rand1D(&dN_dxtdy_for_one_particle_species,
-                                     ran_gen_ptr, 0);
+        dN_block_.resize(block_species.size()*FO_length);
+        calculate_dN_dxtdy_for_species_block(block_species, dN_block_.data());
 
-        // first get total number of particles
-        double dN_dy = rand1D.return_sum();
-
-        // get y range for sampling
-        const double y_LB = paraRdr->getVal("y_LB");
-        const double y_RB = paraRdr->getVal("y_RB");
-        double dN;
-        if (hydro_mode != 2) {
-            dN = (y_RB - y_LB)*dN_dy;
-        } else {
-            // for (3+1)-d case, dN_dy is total N (summing over all etas)
-            dN = dN_dy;
-        }
-        if (echoLevel_ > 0) {
-            messager_ << " -- Sampling using dN_dy=" << dN_dy << ", "
-                      << "dN=" << dN << "...";
-            messager_.flush("info");
-        }
-
-        Stopwatch sw;
-        sw.tic();
-
-        if (AMOUNT_OF_OUTPUT > 7) {
-            print_progressbar(-1);
-        }
-
-        for (long repeated_sampling_idx = 1; 
-             repeated_sampling_idx <= number_of_repeated_sampling;
-             repeated_sampling_idx++) {
-            long number_to_sample = determine_number_to_sample(
-                dN, sampling_model, sampling_para1);
-
-            long sample_idx = 1;
-            while (sample_idx <= number_to_sample) {
-                // first, sample eta and freeze-out cell index
-                long FO_idx = rand1D.rand();
-                const FO_surf_LRF *surf = &FOsurf_ptr[FO_idx];
-
-                if (cellVisCoeffsReady_) {
-                    const double *coeffs = &cellVisCoeffs_[
-                                                    FO_idx*kMaxVisCoeffs_];
-                    visCoefficients.assign(
-                            coeffs, coeffs + cellVisCoeffsSize_[FO_idx]);
-                } else {
-                    getCellVisCoefficients(surf, visCoefficients);
-                }
-
-                // diffusion delta f
-                double deltaf_qmu_coeff = 1.0;
-                if (bINCLUDE_DIFFUSION_DELTAF)
-                    deltaf_qmu_coeff = get_deltaf_qmu_coeff(surf->Tdec,
-                                                            surf->muB);
-
-                // next sample pt and phi
-                double pT, phi, y_minus_eta_s;
-                int status = sample_momemtum_from_a_fluid_cell(
-                                mass, sign, baryon, strange, charge,
-                                surf, visCoefficients, deltaf_qmu_coeff,
-                                pT, phi, y_minus_eta_s);
-
-                if (status == 0) {
-                    continue;
-                } else {
-                    sample_idx++;
-                }
-                //number_of_success++; // to track success rate
-
-                double eta_s = surf->eta;
-                if (hydro_mode != 2) {
-                    double rap = (y_LB + (y_RB - y_LB)
-                                         *ran_gen_ptr->rand_uniform());
-                    eta_s = rap - y_minus_eta_s;
-                }
-
-                add_one_sampled_particle(
-                    repeated_sampling_idx, surf, particle->monval,
-                    mass, pT, phi, y_minus_eta_s, eta_s);
-
-                if (local_charge_conservation == 1 && particle->charge > 0) {
-                    // sample a negative particle from the same fluid cell
-                    double pT2, phi2, y_minus_eta_s2;
-                    int status2 = 0;
-                    do {
-                        status2 = sample_momemtum_from_a_fluid_cell(
-                                mass, sign, -baryon, -strange, -charge,
-                                surf, visCoefficients, deltaf_qmu_coeff,
-                                pT2, phi2, y_minus_eta_s2);
-                    } while (status2 == 0);
-                    add_one_sampled_particle(
-                        repeated_sampling_idx, surf, -particle->monval,
-                        mass, pT2, phi2, y_minus_eta_s2, eta_s);
-                }
+        for (size_t s = 0; s < block_species.size(); s++) {
+            const int idx = block_species[s];
+            if (echoLevel_ > 0) {
+                messager_ << "Index: " << block_n[s] << ", Name: "
+                          << particles[idx].name
+                          << ", Monte-carlo index: " << particles[idx].monval;
+                messager_.flush("info");
             }
-
-            if (AMOUNT_OF_OUTPUT > 7) {
-                print_progressbar(
-                        static_cast<double>(repeated_sampling_idx)
-                                            /number_of_repeated_sampling);
+            const double *dN_cell = &dN_block_[s*FO_length];
+            if (correlated_sampling_) {
+                sample_one_species_correlated(idx, dN_cell);
+            } else {
+                sample_one_species_conventional(idx, dN_cell);
             }
         }
-        if (AMOUNT_OF_OUTPUT > 7) print_progressbar(1);
-
-        sw.toc();
-        if (AMOUNT_OF_OUTPUT > 2) {
-            cout << endl << "Sampling finished in " 
-                 << sw.takeTime() << " seconds." << endl;
-        }
-
+        block_species.clear();
+        block_n.clear();
     }   // n; particle loop
     release_cell_visCoefficients();
+    release_cell_yield_inputs();
     release_cell_blocks();
 
     sw_total.toc();
@@ -1294,6 +1309,134 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
         cout << endl 
              << "sample_using_dN_dxtdy_4all_particles finished in " 
              << sw_total.takeTime() << " seconds." << endl;
+    }
+}
+
+
+void FSSW::sample_one_species_conventional(const int real_particle_idx,
+                                           const double *dN_cell) {
+// One species from its yield dN_cell[l] in every cell: per sample a
+// multiplicity, per hadron its cell from the inverse CDF over all cells,
+// then its momentum.
+    const particle_info *particle = &particles[real_particle_idx];
+    const double mass = particle->mass;
+    const int sign    = particle->sign;
+    const int baryon  = particle->baryon;
+    const int strange = particle->strange;
+    const int charge  = particle->charge;
+    const int sampling_model    = paraRdr->getVal("dN_dy_sampling_model");
+    const double sampling_para1 = paraRdr->getVal("dN_dy_sampling_para1");
+    std::vector<double> visCoeffs_local;
+
+    // prepare the inverse CDF
+    RandomVariable1DArray rand1D(dN_cell, FO_length, ran_gen_ptr,
+                                 invCDF_storage_, 0);
+
+    // first get total number of particles
+    double dN_dy = rand1D.return_sum();
+
+    // get y range for sampling
+    const double y_LB = paraRdr->getVal("y_LB");
+    const double y_RB = paraRdr->getVal("y_RB");
+    double dN;
+    if (hydro_mode != 2) {
+        dN = (y_RB - y_LB)*dN_dy;
+    } else {
+        // for (3+1)-d case, dN_dy is total N (summing over all etas)
+        dN = dN_dy;
+    }
+    if (echoLevel_ > 0) {
+        messager_ << " -- Sampling using dN_dy=" << dN_dy << ", "
+                  << "dN=" << dN << "...";
+        messager_.flush("info");
+    }
+
+    Stopwatch sw;
+    sw.tic();
+
+    if (AMOUNT_OF_OUTPUT > 7) {
+        print_progressbar(-1);
+    }
+
+    for (long repeated_sampling_idx = 1; 
+         repeated_sampling_idx <= number_of_repeated_sampling;
+         repeated_sampling_idx++) {
+        long number_to_sample = determine_number_to_sample(
+            dN, sampling_model, sampling_para1);
+
+        long sample_idx = 1;
+        while (sample_idx <= number_to_sample) {
+            // first, sample eta and freeze-out cell index
+            long FO_idx = rand1D.rand();
+            const FO_surf_LRF *surf = &FOsurf_ptr[FO_idx];
+
+            const double *visCoefficients;
+            if (cellVisCoeffsReady_) {
+                visCoefficients = &cellVisCoeffs_[FO_idx*kMaxVisCoeffs_];
+            } else {
+                getCellVisCoefficients(surf, visCoeffs_local);
+                visCoefficients = visCoeffs_local.data();
+            }
+
+            // diffusion delta f
+            double deltaf_qmu_coeff = 1.0;
+            if (bINCLUDE_DIFFUSION_DELTAF)
+                deltaf_qmu_coeff = get_deltaf_qmu_coeff(surf->Tdec,
+                                                        surf->muB);
+
+            // next sample pt and phi
+            double pT, phi, y_minus_eta_s;
+            int status = sample_momemtum_from_a_fluid_cell(
+                            mass, sign, baryon, strange, charge,
+                            surf, visCoefficients, deltaf_qmu_coeff,
+                            pT, phi, y_minus_eta_s);
+
+            if (status == 0) {
+                continue;
+            } else {
+                sample_idx++;
+            }
+            //number_of_success++; // to track success rate
+
+            double eta_s = surf->eta;
+            if (hydro_mode != 2) {
+                double rap = (y_LB + (y_RB - y_LB)
+                                     *ran_gen_ptr->rand_uniform());
+                eta_s = rap - y_minus_eta_s;
+            }
+
+            add_one_sampled_particle(
+                repeated_sampling_idx, surf, particle->monval,
+                mass, pT, phi, y_minus_eta_s, eta_s);
+
+            if (local_charge_conservation == 1 && particle->charge > 0) {
+                // sample a negative particle from the same fluid cell
+                double pT2, phi2, y_minus_eta_s2;
+                int status2 = 0;
+                do {
+                    status2 = sample_momemtum_from_a_fluid_cell(
+                            mass, sign, -baryon, -strange, -charge,
+                            surf, visCoefficients, deltaf_qmu_coeff,
+                            pT2, phi2, y_minus_eta_s2);
+                } while (status2 == 0);
+                add_one_sampled_particle(
+                    repeated_sampling_idx, surf, -particle->monval,
+                    mass, pT2, phi2, y_minus_eta_s2, eta_s);
+            }
+        }
+
+        if (AMOUNT_OF_OUTPUT > 7) {
+            print_progressbar(
+                    static_cast<double>(repeated_sampling_idx)
+                                        /number_of_repeated_sampling);
+        }
+    }
+    if (AMOUNT_OF_OUTPUT > 7) print_progressbar(1);
+
+    sw.toc();
+    if (AMOUNT_OF_OUTPUT > 2) {
+        cout << endl << "Sampling finished in " 
+             << sw.takeTime() << " seconds." << endl;
     }
 }
 
@@ -1377,8 +1520,9 @@ void FSSW::release_cell_blocks() {
 void FSSW::decay_one_primary(const iSS_Hadron &primary,
                              std::vector<iSS_Hadron> &sample) {
 // perform_resonance_feed_down for one primary: its whole decay chain
-    std::vector<iSS_Hadron> chain(1, primary);
-    std::vector<iSS_Hadron> daughters;
+    std::vector<iSS_Hadron> &chain = decay_chain_;
+    std::vector<iSS_Hadron> &daughters = decay_daughters_;
+    chain.assign(1, primary);
     for (size_t ipart = 0; ipart < chain.size(); ipart++) {
         iSS_Hadron mother = chain[ipart];
         daughters.clear();
@@ -1394,7 +1538,8 @@ void FSSW::decay_one_primary(const iSS_Hadron &primary,
 }
 
 
-void FSSW::sample_one_species_correlated(const int real_particle_idx) {
+void FSSW::sample_one_species_correlated(const int real_particle_idx,
+                                         const double *dN_cell) {
     const particle_info *particle = &particles[real_particle_idx];
     const double mass = particle->mass;
     const int sign    = particle->sign;
@@ -1412,7 +1557,7 @@ void FSSW::sample_one_species_correlated(const int real_particle_idx) {
     // (3+1)-d: dN_dxtdy is the cell's yield; (2+1)-d: per unit rapidity
     const double y_factor = (hydro_mode != 2) ? (y_RB - y_LB) : 1.0;
 
-    std::vector<double> visCoefficients;
+    std::vector<double> visCoeffs_local;
     std::vector<double> block_cdf;
     const long n_blocks = static_cast<long>(block_word_.size());
     for (long b = 0; b < n_blocks; b++) {
@@ -1421,7 +1566,7 @@ void FSSW::sample_one_species_correlated(const int real_particle_idx) {
         block_cdf.resize(n_cells);
         double block_yield = 0.;
         for (long j = 0; j < n_cells; j++) {
-            block_yield += dN_dxtdy_for_one_particle_species[block_order_[j0 + j]];
+            block_yield += dN_cell[block_order_[j0 + j]];
             block_cdf[j] = block_yield;
         }
         if (block_yield <= 0.) continue;
@@ -1455,13 +1600,12 @@ void FSSW::sample_one_species_correlated(const int real_particle_idx) {
                 const long FO_idx = block_order_[j0 + j];
                 surf = &FOsurf_ptr[FO_idx];
 
+                const double *visCoefficients;
                 if (cellVisCoeffsReady_) {
-                    const double *coeffs = &cellVisCoeffs_[
-                                                    FO_idx*kMaxVisCoeffs_];
-                    visCoefficients.assign(
-                            coeffs, coeffs + cellVisCoeffsSize_[FO_idx]);
+                    visCoefficients = &cellVisCoeffs_[FO_idx*kMaxVisCoeffs_];
                 } else {
-                    getCellVisCoefficients(surf, visCoefficients);
+                    getCellVisCoefficients(surf, visCoeffs_local);
+                    visCoefficients = visCoeffs_local.data();
                 }
                 double deltaf_qmu_coeff = 1.0;
                 if (bINCLUDE_DIFFUSION_DELTAF)
@@ -2175,33 +2319,25 @@ void FSSW::perform_resonance_feed_down(
     }
     // loop over events
     unsigned int nev = input_particle_list->size();
+    vector<iSS_Hadron> temp_list;
+    vector<iSS_Hadron> daughter_list;
     for (unsigned int ievent = 0; ievent < nev; ievent++) {
-        // create a temporary particle list
-        vector<iSS_Hadron> temp_list;
-        // copy all particles into the temp list
-        unsigned int Npart = (*input_particle_list)[ievent]->size();
-        for (unsigned int ipart = 0; ipart < Npart; ipart++) {
-            temp_list.push_back((*(*input_particle_list)[ievent])[ipart]);
-        }
-        (*input_particle_list)[ievent]->clear();
+        // the event's primaries; unstable daughters are appended to them
+        vector<iSS_Hadron> *event_list = (*input_particle_list)[ievent];
+        temp_list.assign(event_list->begin(), event_list->end());
+        event_list->clear();
         // perform resonance decays
         for (unsigned int ipart = 0; ipart < temp_list.size(); ipart++) {
-            vector<iSS_Hadron> *daughter_list = new vector<iSS_Hadron>;
-            decayer_ptr_->perform_decays(&temp_list[ipart], daughter_list);
-            for (unsigned int idaughter = 0; idaughter < daughter_list->size();
-                    idaughter++) {
-                if (decayer_ptr_->check_particle_stable(
-                                        &(*daughter_list)[idaughter]) == 1) {
-                    (*input_particle_list)[ievent]->push_back(
-                                            (*daughter_list)[idaughter]);
+            daughter_list.clear();
+            decayer_ptr_->perform_decays(&temp_list[ipart], &daughter_list);
+            for (auto &daughter : daughter_list) {
+                if (decayer_ptr_->check_particle_stable(&daughter) == 1) {
+                    event_list->push_back(daughter);
                 } else {
-                    temp_list.push_back((*daughter_list)[idaughter]);
+                    temp_list.push_back(daughter);
                 }
             }
-            daughter_list->clear();
-            delete daughter_list;
         }
-        temp_list.clear();
     }
 }
 
@@ -2223,7 +2359,7 @@ double FSSW::get_deltaf_bulk(
         const double mass, const double pdotu, const double bulkPi,
         const double Tdec, const int sign, const int baryon,
         const int strange, const int charge,
-        const double f0, const std::vector<double> &bulkvisCoefficients) {
+        const double f0, const double *bulkvisCoefficients) {
     if (!bINCLUDE_BULK_DELTAF) return(0.0);
     double delta_f_bulk = 0.0;
     if (bulk_deltaf_kind_ == 0) {
@@ -2280,7 +2416,7 @@ int FSSW::sample_momemtum_from_a_fluid_cell(
         const double mass, const int sign,
         const int baryon, const int strange, const int charge,
         const FO_surf_LRF *surf,
-        const std::vector<double> &visCoefficients,
+        const double *visCoefficients,
         const double deltaf_qmu_coeff,
         double &pT, double &phi, double &y_minus_eta_s
         ) {
