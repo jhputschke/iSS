@@ -1260,6 +1260,9 @@ int read_FOdata::read_resonances_list(std::vector<particle_info> &particle) {
         if (!resofile.eof()) {
             particle.push_back(particle_i);
         } else {
+            // the read past the last entry: not kept, so neither its channels
+            for (auto *channel : particle_i.decay_channels) delete channel;
+            particle_i.decay_channels.clear();
             particle_i.baryon = 0;
         }
 

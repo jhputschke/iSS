@@ -35,6 +35,11 @@ void iSS::clear() {
     FOsurf_array_.clear();
     FOsurf_LRF_array_.clear();
     FOsurf_Tmunu_.clear();
+    // the decay channels are allocated by read_FOdata::read_resonances_list
+    // and owned here; the copies in the samplers do not use them
+    for (auto &particle_i : particle_) {
+        for (auto *channel : particle_i.decay_channels) delete channel;
+    }
     particle_.clear();
 }
 

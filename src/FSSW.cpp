@@ -296,9 +296,9 @@ FSSW::~FSSW() {
     }
 
     for (unsigned int i = 0; i < Hadron_list->size(); i++) {
-        (*Hadron_list)[i]->clear();
+        delete (*Hadron_list)[i];
     }
-    Hadron_list->clear();
+    delete Hadron_list;
 }
 //***************************************************************************
 
