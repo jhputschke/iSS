@@ -56,19 +56,24 @@ RandomVariable1DArray::RandomVariable1DArray(const double *data, long n,
 //----------------------------------------------------------------------
 void RandomVariable1DArray::build(const double *data, double zero) {
     // generate inverse CDF
-    data_sum = 0.0;
-    (*invCDF)[0] = 0.0;
-    for (long l = 0; l < data_size; l++) {
+    // the running sum in a local: the stores to the inverse CDF could alias
+    // the member data_sum, which would then go through memory every step
+    double *out = invCDF->data();
+    const long n = data_size;
+    double sum = 0.0;
+    out[0] = 0.0;
+    for (long l = 0; l < n; l++) {
         double val = data[l];
       
         // enforce positiveness
         if (val<zero) val = zero;
 
-        data_sum += val;
+        sum += val;
 
         // copy to inverse CDF
-        (*invCDF)[l+1] = data_sum;
+        out[l+1] = sum;
     }
+    data_sum = sum;
 }
 
 
