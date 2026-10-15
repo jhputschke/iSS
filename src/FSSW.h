@@ -161,6 +161,22 @@ class FSSW {
     //! particle decay
     bool flag_perform_decays_;
     std::unique_ptr<particle_decay> decayer_ptr_;
+    //! decay_smash_list = 1: iSS decays the SMASH hadron list (EOS 91) too,
+    //! for runs without SMASH. 0 (default): the SMASH list is left to SMASH,
+    //! as before.
+    bool decay_smash_list_ = false;
+    //! decays happen: perform_decays, and not a SMASH list left to SMASH
+    bool decays_on() const {
+        return flag_perform_decays_
+               && (afterburner_type_ != AfterburnerType::SMASH
+                   || decay_smash_list_);
+    }
+
+    //! keep_primaries = N: the undecayed hadrons of the first N samples, as
+    //! sampled (before any decay), next to Hadron_list: for an afterburner
+    //! run later. Takes no random numbers, so Hadron_list is the same.
+    int keep_primaries_ = 0;
+    std::vector<std::vector<iSS_Hadron>> primary_list_;
 
     //! spectators
     bool flag_spectators_;
@@ -248,6 +264,14 @@ class FSSW {
 
     std::vector<iSS_Hadron>* get_hadron_list_iev(const int iev) {
         return(Hadron_list->at(iev));
+    }
+
+    //! keep_primaries: the samples with primaries (the first N), and one
+    int get_number_of_primary_samples() const {
+        return(static_cast<int>(primary_list_.size()));
+    }
+    std::vector<iSS_Hadron>* get_primary_list_iev(const int iev) {
+        return(&primary_list_.at(iev));
     }
 
     void addSpectatorsToHadronList();

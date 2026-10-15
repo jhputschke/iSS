@@ -145,6 +145,9 @@ FSSW::FSSW(std::shared_ptr<RandomUtil::Random> ran_gen,
     flag_store_samples_in_memory = 1;
     Hadron_list = new vector< vector<iSS_Hadron>* >;
 
+    decay_smash_list_ = (paraRdr->getVal("decay_smash_list", 0) != 0);
+    keep_primaries_ = std::max(0, static_cast<int>(
+                                    paraRdr->getVal("keep_primaries", 0)));
     if (paraRdr->getVal("perform_decays") == 1) {
         flag_perform_decays_ = true;
         decayer_ptr_ = std::unique_ptr<particle_decay>(new particle_decay(
@@ -400,13 +403,31 @@ bool FSSW::particles_are_the_same(int idx1, int idx2) {
 //***************************************************************************
 void FSSW::shell() {
     sample_using_dN_dxtdy_4all_particles_conventional();
-    if (flag_perform_decays_ && afterburner_type_ != AfterburnerType::SMASH
-            && !correlated_sampling_) {
+    if (!correlated_sampling_) {
+        // (correlated sampling keeps the primaries as it samples them)
+        for (size_t i = 0; i < primary_list_.size(); i++) {
+            primary_list_[i] = *(*Hadron_list)[i];
+        }
+    }
+    if (decays_on() && !correlated_sampling_) {
         // (correlated sampling decays each primary as it is sampled)
         perform_resonance_feed_down(Hadron_list);
     }
     if (flag_spectators_)
         addSpectatorsToHadronList();
+    if (decays_on() && afterburner_type_ == AfterburnerType::SMASH) {
+        // the SMASH list's closed channels (particle_decay::smash_list_)
+        if (echoLevel_ > 0 || decayer_ptr_->get_n_undecayed() > 0) {
+            messager_ << "SMASH-list decays: " << decayer_ptr_->get_n_closed_at_pole()
+                      << " channels closed at the pole masses opened with "
+                      << "Breit-Wigner daughter masses, "
+                      << decayer_ptr_->get_n_redrawn() << " re-drawn, "
+                      << decayer_ptr_->get_n_undecayed()
+                      << " mothers left undecayed (no channel open)";
+            messager_.flush(decayer_ptr_->get_n_undecayed() > 0 ? "warning"
+                                                                 : "info");
+        }
+    }
 
     //computeAvgTotalEnergyMomentum();
 
@@ -1244,6 +1265,8 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
             Hadron_list->push_back(new vector<iSS_Hadron> );
         }
     }
+    primary_list_.assign(std::min(keep_primaries_, number_of_repeated_sampling),
+                         std::vector<iSS_Hadron>());
 
     // use "conventional" sampling
     if (echoLevel_ > 0) {
@@ -1526,7 +1549,10 @@ void FSSW::decay_one_primary(const iSS_Hadron &primary,
     for (size_t ipart = 0; ipart < chain.size(); ipart++) {
         iSS_Hadron mother = chain[ipart];
         daughters.clear();
-        decayer_ptr_->perform_decays(&mother, &daughters);
+        if (!decayer_ptr_->perform_decays(&mother, &daughters)) {
+            sample.push_back(mother);       // no channel open at its mass
+            continue;
+        }
         for (auto &daughter : daughters) {
             if (decayer_ptr_->check_particle_stable(&daughter) == 1) {
                 sample.push_back(daughter);
@@ -1546,8 +1572,8 @@ void FSSW::sample_one_species_correlated(const int real_particle_idx,
     const int baryon  = particle->baryon;
     const int strange = particle->strange;
     const int charge  = particle->charge;
-    const bool decays = (flag_perform_decays_
-                         && afterburner_type_ != AfterburnerType::SMASH);
+    const bool decays = decays_on();
+    const int n_keep = static_cast<int>(primary_list_.size());
 
     const uint32_t seed = static_cast<uint32_t>(ran_gen_ptr->get_seed());
     const uint32_t species = static_cast<uint32_t>(particle->monval);
@@ -1625,6 +1651,9 @@ void FSSW::sample_one_species_correlated(const int real_particle_idx,
             const iSS_Hadron primary = make_sampled_particle(
                 surf, particle->monval, mass, pT, phi, y_minus_eta_s, eta_s);
             std::vector<iSS_Hadron> &sample = *(*Hadron_list)[isample];
+            if (isample < n_keep) {
+                primary_list_[isample].push_back(primary);
+            }
             if (decays) {
                 ran_gen_ptr->set_stream(seed, species, w0, w1,
                                         kPhiloxDecay | static_cast<uint32_t>(i));
@@ -2329,7 +2358,11 @@ void FSSW::perform_resonance_feed_down(
         // perform resonance decays
         for (unsigned int ipart = 0; ipart < temp_list.size(); ipart++) {
             daughter_list.clear();
-            decayer_ptr_->perform_decays(&temp_list[ipart], &daughter_list);
+            if (!decayer_ptr_->perform_decays(&temp_list[ipart],
+                                              &daughter_list)) {
+                event_list->push_back(temp_list[ipart]);   // no channel open
+                continue;
+            }
             for (auto &daughter : daughter_list) {
                 if (decayer_ptr_->check_particle_stable(&daughter) == 1) {
                     event_list->push_back(daughter);
@@ -2350,6 +2383,8 @@ void FSSW::addSpectatorsToHadronList() {
         auto spectatorList = spectators_ptr_->getSpectatorList();
         for (auto ispec: spectatorList) {
             (*Hadron_list)[ievent]->push_back(ispec);
+            if (ievent < primary_list_.size())
+                primary_list_[ievent].push_back(ispec);
         }
     }
 }

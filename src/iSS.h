@@ -96,6 +96,19 @@ class iSS {
         }
     }
 
+    //! keep_primaries (MC_sampling = 4): the samples whose undecayed hadrons
+    //! were kept (the first N), and one of them
+    int get_number_of_primary_samples() {
+        if (paraRdr_ptr->getVal("MC_sampling") == 4 && spectra_sampler_) {
+            return(spectra_sampler_->get_number_of_primary_samples());
+        }
+        return(0);
+    }
+
+    std::vector<iSS_Hadron>* get_primary_list_iev(const int iev) {
+        return(spectra_sampler_->get_primary_list_iev(iev));
+    }
+
     void clear();
 
     // this function transform all the variables to local rest frame of the

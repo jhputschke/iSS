@@ -13,7 +13,8 @@ using namespace std;
 particle_decay::particle_decay(shared_ptr<RandomUtil::Random> ran_gen,
                                AfterburnerType afterburner_type,
                                string table_path) :
-        table_path_(table_path), afterburner_type_(afterburner_type) {
+        table_path_(table_path), afterburner_type_(afterburner_type),
+        smash_list_(afterburner_type == AfterburnerType::SMASH) {
     ran_gen_ptr = ran_gen;
     resonance_table.clear();
     read_resonances_list();
@@ -234,13 +235,13 @@ int particle_decay::get_particle_strange_number(int monval) {
 
 
 //! This is a shell function to perform resonance decays
-void particle_decay::perform_decays(
+bool particle_decay::perform_decays(
             iSS_Hadron *mother, vector<iSS_Hadron>* daughter_list) {
     particle_info* mother_decay_info = find_resonance(mother->pid);
     if (mother_decay_info->stable == 1) {
         // the particle is a stable particle
         daughter_list->push_back(*mother);
-        return;
+        return(true);
     }
     int N_decay_channel = mother_decay_info->decays;
     double random_local = ran_gen_ptr->rand_uniform();
@@ -254,15 +255,56 @@ void particle_decay::perform_decays(
             break;
         }
     }
+    if (smash_list_) {
+        if (picked_channel == NULL) {
+            // the branching ratios sum to 1 only up to rounding
+            picked_channel = mother_decay_info->decay_channels.back();
+        }
+        if (!channel_can_open(mother->mass, picked_channel)) {
+            // closed even at the daughters' lowest masses: draw again among
+            // the channels that are open at this mass, by branching ratio
+            double open_sum = 0.;
+            for (auto *channel : mother_decay_info->decay_channels) {
+                if (channel->branching_ratio > 0.
+                        && channel_can_open(mother->mass, channel)) {
+                    open_sum += channel->branching_ratio;
+                }
+            }
+            if (open_sum <= 0.) {
+                n_undecayed_++;
+                return(false);
+            }
+            n_redrawn_++;
+            double random_open = ran_gen_ptr->rand_uniform()*open_sum;
+            double cumulated = 0.;
+            picked_channel = NULL;
+            for (auto *channel : mother_decay_info->decay_channels) {
+                if (channel->branching_ratio > 0.
+                        && channel_can_open(mother->mass, channel)) {
+                    picked_channel = channel;
+                    cumulated += channel->branching_ratio;
+                    if (cumulated > random_open) break;
+                }
+            }
+        }
+    }
     int N_decay_part = picked_channel->decay_Npart;
+    std::array<double, 5> masses;
+    if (smash_list_ && (N_decay_part == 2 || N_decay_part == 3)) {
+        daughter_masses(mother->mass, picked_channel, masses);
+    } else {
+        for (int k = 0; k < N_decay_part && k < 5; k++) {
+            masses[k] = get_particle_mass(picked_channel->decay_part[k]);
+        }
+    }
     if (N_decay_part == 2) {
         iSS_Hadron daughter1, daughter2;
         int decay_part1_monval = picked_channel->decay_part[0];
         int decay_part2_monval = picked_channel->decay_part[1];
         daughter1.pid = decay_part1_monval;
         daughter2.pid = decay_part2_monval;
-        daughter1.mass = get_particle_mass(decay_part1_monval);
-        daughter2.mass = get_particle_mass(decay_part2_monval);
+        daughter1.mass = masses[0];
+        daughter2.mass = masses[1];
         perform_two_body_decay(mother, &daughter1, &daughter2);
         daughter_list->push_back(daughter1);
         daughter_list->push_back(daughter2);
@@ -274,14 +316,109 @@ void particle_decay::perform_decays(
         daughter1.pid = decay_part1_monval;
         daughter2.pid = decay_part2_monval;
         daughter3.pid = decay_part3_monval;
-        daughter1.mass = get_particle_mass(decay_part1_monval);
-        daughter2.mass = get_particle_mass(decay_part2_monval);
-        daughter3.mass = get_particle_mass(decay_part3_monval);
+        daughter1.mass = masses[0];
+        daughter2.mass = masses[1];
+        daughter3.mass = masses[2];
         perform_three_body_decay(mother, &daughter1, &daughter2, &daughter3);
         daughter_list->push_back(daughter1);
         daughter_list->push_back(daughter2);
         daughter_list->push_back(daughter3);
     }
+    return(true);
+}
+
+
+//! the lowest mass a particle takes as a daughter: its pole mass if it has
+//! no width, else the lowest mass it can still decay from
+static inline bool has_breit_wigner(const particle_info *reso) {
+    return reso->stable == 0 && reso->width > 1e-10;
+}
+
+
+double particle_decay::min_decay_mass(int monval) {
+    auto it = min_mass_cache_.find(monval);
+    if (it != min_mass_cache_.end()) return(it->second);
+    const particle_info *reso = find_resonance(monval);
+    if (reso == nullptr) {
+        cout << "[Error]:particle_decay::min_decay_mass(): "
+             << "Can not find particle with monval = " << monval << endl;
+        exit(1);
+    }
+    // the pole mass first: a (non-physical) cycle in the table ends there
+    min_mass_cache_[monval] = reso->mass;
+    if (reso->stable == 1) return(reso->mass);
+    double lowest = -1.;
+    for (const auto *channel : reso->decay_channels) {
+        if (channel->branching_ratio <= 0. || channel->decay_Npart < 2
+                || channel->decay_Npart > 5) {
+            continue;
+        }
+        double sum = 0.;
+        for (int k = 0; k < channel->decay_Npart; k++) {
+            const int d = channel->decay_part[k];
+            const particle_info *dr = find_resonance(d);
+            sum += (dr != nullptr && has_breit_wigner(dr)) ? min_decay_mass(d)
+                                                           : get_particle_mass(d);
+        }
+        if (lowest < 0. || sum < lowest) lowest = sum;
+    }
+    if (lowest > 0.) min_mass_cache_[monval] = lowest;
+    return(min_mass_cache_[monval]);
+}
+
+
+bool particle_decay::channel_can_open(double M,
+                                      const decay_channel_info *channel) {
+    const int n = channel->decay_Npart;
+    if (n < 2 || n > 3) return(false);
+    double sum = 0.;
+    for (int k = 0; k < n; k++) {
+        const int d = channel->decay_part[k];
+        const particle_info *dr = find_resonance(d);
+        sum += (dr != nullptr && has_breit_wigner(dr)) ? min_decay_mass(d)
+                                                       : get_particle_mass(d);
+    }
+    return(sum < M);
+}
+
+
+void particle_decay::daughter_masses(double M,
+                                     const decay_channel_info *channel,
+                                     std::array<double, 5> &masses) {
+    const int n = channel->decay_Npart;
+    std::array<double, 5> lo, width;
+    std::array<bool, 5> bw;
+    double sum_pole = 0., sum_lo = 0.;
+    for (int k = 0; k < n; k++) {
+        const int d = channel->decay_part[k];
+        const particle_info *dr = find_resonance(d);
+        masses[k] = get_particle_mass(d);
+        bw[k] = (dr != nullptr && has_breit_wigner(dr));
+        width[k] = bw[k] ? dr->width : 0.;
+        lo[k] = bw[k] ? min_decay_mass(d) : masses[k];
+        sum_pole += masses[k];
+        sum_lo += lo[k];
+    }
+    if (sum_pole < M) return;    // open at the pole masses: as before
+    n_closed_at_pole_++;
+    std::array<double, 5> pole = masses;
+    // each unstable daughter from its Breit-Wigner between its lowest mass
+    // and what the others leave at their lowest; with two or more of them
+    // the sum can still exceed M: draw again
+    for (int itry = 0; itry < 10000; itry++) {
+        double total = 0.;
+        for (int k = 0; k < n; k++) {
+            if (bw[k]) {
+                const double hi = M - (sum_lo - lo[k]);
+                masses[k] = sample_breit_wigner(pole[k], width[k], lo[k], hi);
+            }
+            total += masses[k];
+        }
+        if (total < M) return;
+    }
+    // never seen: share the room above the lowest masses evenly
+    const double room = (M - sum_lo)/n;
+    for (int k = 0; k < n; k++) masses[k] = lo[k] + (bw[k] ? room : 0.);
 }
 
 //! This function returns the particle mass for a given particle id
@@ -513,6 +650,18 @@ double particle_decay::sample_breit_wigner(double mass, double width,
     // generate a random number from p_min to 1
     double y = (1. - p_min)*ran_gen_ptr->rand_uniform() + p_min;
     // compute the corresponding sampled mass
+    double mass_sampled = mass + width/2.*tan(M_PI*(y - 0.5));
+    return(mass_sampled);
+}
+
+
+double particle_decay::sample_breit_wigner(double mass, double width,
+                                           double M_min, double M_max) {
+    // the inverse CDF as above, between the probabilities of M_min and M_max
+    double p_min = atan2((M_min - mass), width/2.)/M_PI + 0.5;
+    double p_max = atan2((M_max - mass), width/2.)/M_PI + 0.5;
+    if (p_max < p_min) p_max = p_min;
+    double y = p_min + (p_max - p_min)*ran_gen_ptr->rand_uniform();
     double mass_sampled = mass + width/2.*tan(M_PI*(y - 0.5));
     return(mass_sampled);
 }
