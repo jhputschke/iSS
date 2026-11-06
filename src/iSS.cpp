@@ -5,6 +5,10 @@
 #include "Table.h"
 #include "arsenal.h"
 #include "iSS.h"
+#include <iterator>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "Random.h"
 #include "data_struct.h"
 #include "Histogram.h"
@@ -230,8 +234,30 @@ void iSS::transform_to_local_rest_frame(
     if (echoLevel_ > 0) {
         messager.info("Transforming fluid cells to their local rest frame ...");
     }
-    FOsurf_LRF_ptr.reserve(FOsurf_ptr.size());
-    for (auto &surf_i: FOsurf_ptr) {
+    // every cell on its own: in parallel, the same arithmetic per cell.
+    // A static schedule gives the threads consecutive ranges of cells in
+    // thread order, so their lists of kept cells (dsigma^0 >= 0 in the rest
+    // frame), joined in thread order, are in the surface's order. One
+    // thread appends to FOsurf_LRF_ptr directly, as before.
+    const long n_cells = static_cast<long>(FOsurf_ptr.size());
+    FOsurf_LRF_ptr.reserve(FOsurf_LRF_ptr.size() + n_cells);
+    int n_threads = 1;
+#ifdef _OPENMP
+    n_threads = omp_get_max_threads();
+#endif
+    std::vector<std::vector<FO_surf_LRF>> parts(n_threads > 1 ? n_threads : 0);
+    #pragma omp parallel num_threads(n_threads)
+    {
+    std::vector<FO_surf_LRF> *out = &FOsurf_LRF_ptr;
+    if (n_threads > 1) {
+#ifdef _OPENMP
+        out = &parts[omp_get_thread_num()];
+#endif
+        out->reserve(n_cells/n_threads + 1);
+    }
+    #pragma omp for schedule(static)
+    for (long icell = 0; icell < n_cells; icell++) {
+        const FO_surf &surf_i = FOsurf_ptr[icell];
         FO_surf_LRF surf_LRF_i;
         surf_LRF_i.tau = surf_i.tau;
         surf_LRF_i.xpt = surf_i.xpt;
@@ -349,7 +375,14 @@ void iSS::transform_to_local_rest_frame(
         surf_LRF_i.piLRF_yy = pi_LRF[2][2];
         surf_LRF_i.piLRF_yz = pi_LRF[2][3];
 
-        FOsurf_LRF_ptr.push_back(surf_LRF_i);
+        out->push_back(surf_LRF_i);
+    }
+    }   // omp parallel
+    for (auto &part : parts) {
+        FOsurf_LRF_ptr.insert(FOsurf_LRF_ptr.end(),
+                              std::make_move_iterator(part.begin()),
+                              std::make_move_iterator(part.end()));
+        std::vector<FO_surf_LRF>().swap(part);
     }
 }
 

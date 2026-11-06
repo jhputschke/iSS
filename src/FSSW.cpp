@@ -22,6 +22,10 @@
 #include "data_struct.h"
 #include "readindata.h"
 #include "FSSW.h"
+#include <atomic>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "RandomVariable1DArray.h"
 #include "RandomVariable2DArray.h"
 #include "ParameterReader.h"
@@ -750,7 +754,7 @@ void FSSW::prepare_cell_visCoefficients() {
     std::vector<double> visCoefficients;
     #pragma omp for schedule(static)
     for (long l = 0; l < FO_length; l++) {
-        getCellVisCoefficients(&FOsurf_ptr[l], visCoefficients);
+        getCellVisCoefficients(&FOsurf_ptr[cell_at(l)], visCoefficients);
         const int n = static_cast<int>(visCoefficients.size());
         if (n > kMaxVisCoeffs_) {
             #pragma omp atomic write
@@ -796,7 +800,7 @@ void FSSW::prepare_cell_yield_inputs() {
     }
     #pragma omp parallel for schedule(static)
     for (long l = 0; l < FO_length; l++) {
-        const FO_surf_LRF &surf = FOsurf_ptr[l];
+        const FO_surf_LRF &surf = FOsurf_ptr[cell_at(l)];
         cell_dsigma_u_[l] = surf.da_mu_LRF[0];
         cell_T_[l]        = surf.Tdec;
         cell_muB_[l]      = surf.muB;
@@ -860,7 +864,8 @@ void FSSW::calculate_dN_dxtdy_for_one_particle_species(
 
 
 void FSSW::calculate_dN_dxtdy_for_species_block(
-        const std::vector<int> &species_idx, double *__restrict__ dN_out) {
+        const std::vector<int> &species_idx, double *__restrict__ dN_out,
+        double *block_yield_out) {
 // dN/(dxt dy) in every cell for a block of species, dN_out[s*FO_length + l],
 // from one pass over the cells. Per (cell, species) the arithmetic is that
 // of one species at a time; the cells' data is read once per block instead
@@ -908,10 +913,21 @@ void FSSW::calculate_dN_dxtdy_for_species_block(
     std::vector<std::array<double, 6>> results(n_species);
     for (auto &r : results) r.fill(0.0);
 
-    // loop over all the fluid cells
-    #pragma omp for schedule(static)
-    for (long l = 0; l < FO_length; l++) {
-        const FO_surf_LRF* surf = &FOsurf_ptr[l];
+    // loop over all the fluid cells; with block_yield_out (correlated
+    // sampling, cells in block order) a block's cells on one thread, and the
+    // block's yield of every species summed right after them, in the cells'
+    // order, while they are in this core's cache
+    const bool by_block = (block_yield_out != nullptr);
+    const long n_blocks = static_cast<long>(block_word_.size());
+    const long n_outer = by_block ? n_blocks : FO_length;
+    // blocks: dynamic, as the cores of a machine may differ in speed
+    const long chunk = by_block ? 16 : 4096;
+    #pragma omp for schedule(dynamic, chunk)
+    for (long ob = 0; ob < n_outer; ob++) {
+    const long l_begin = by_block ? block_start_[ob] : ob;
+    const long l_end = by_block ? block_start_[ob + 1] : ob + 1;
+    for (long l = l_begin; l < l_end; l++) {
+        const FO_surf_LRF* surf = &FOsurf_ptr[cell_at(l)];
         float Tdec, muB, muS, muQ, bulkPi_cell, dsigma_u_cell;
         if (packed_inputs) {
             Tdec          = cell_T_[l];
@@ -1055,7 +1071,18 @@ void FSSW::calculate_dN_dxtdy_for_species_block(
 
             dN_out[s*FO_length + l] = std::max(0., total_N);
         }
+    }   // l: cells (of block ob)
+    if (by_block) {
+        for (int s = 0; s < n_species; s++) {
+            const double *dN_s = dN_out + s*FO_length;
+            double block_yield = 0.;
+            for (long l = l_begin; l < l_end; l++) {
+                block_yield += dN_s[l];
+            }
+            block_yield_out[s*n_blocks + ob] = block_yield;
+        }
     }
+    }   // ob
     }   // omp parallel
 
     sw.toc();
@@ -1234,10 +1261,15 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
                 " Function sample_using_dN_dxtdy_4all_particles started...");
     }
 
+    if (correlated_sampling_) {
+        // the blocks first: the cell arrays below are kept in block order
+        prepare_cell_blocks();
+        cell_order_ = block_order_.data();
+    }
     prepare_cell_visCoefficients();
     prepare_cell_yield_inputs();
     if (correlated_sampling_) {
-        prepare_cell_blocks();
+        prepare_workers();
     }
 
     // control variables
@@ -1303,8 +1335,31 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
         }
 
         dN_block_.resize(block_species.size()*FO_length);
-        calculate_dN_dxtdy_for_species_block(block_species, dN_block_.data());
+        if (correlated_sampling_) {
+            block_yield_.resize(block_species.size()*block_word_.size());
+            calculate_dN_dxtdy_for_species_block(block_species,
+                                                 dN_block_.data(),
+                                                 block_yield_.data());
+        } else {
+            calculate_dN_dxtdy_for_species_block(block_species,
+                                                 dN_block_.data());
+        }
 
+        if (correlated_sampling_ && workers_.size() > 1) {
+            if (echoLevel_ > 0) {
+                for (size_t s = 0; s < block_species.size(); s++) {
+                    messager_ << "Index: " << block_n[s] << ", Name: "
+                              << particles[block_species[s]].name
+                              << ", Monte-carlo index: "
+                              << particles[block_species[s]].monval;
+                    messager_.flush("info");
+                }
+            }
+            sample_species_group_correlated(block_species, dN_block_.data());
+            block_species.clear();
+            block_n.clear();
+            continue;
+        }
         for (size_t s = 0; s < block_species.size(); s++) {
             const int idx = block_species[s];
             if (echoLevel_ > 0) {
@@ -1315,7 +1370,8 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
             }
             const double *dN_cell = &dN_block_[s*FO_length];
             if (correlated_sampling_) {
-                sample_one_species_correlated(idx, dN_cell);
+                sample_one_species_correlated(
+                    idx, dN_cell, &block_yield_[s*block_word_.size()]);
             } else {
                 sample_one_species_conventional(idx, dN_cell);
             }
@@ -1325,7 +1381,9 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
     }   // n; particle loop
     release_cell_visCoefficients();
     release_cell_yield_inputs();
+    cell_order_ = nullptr;
     release_cell_blocks();
+    release_workers();
 
     sw_total.toc();
     if (echoLevel_ > 0) {
@@ -1540,22 +1598,79 @@ void FSSW::release_cell_blocks() {
 }
 
 
-void FSSW::decay_one_primary(const iSS_Hadron &primary,
-                             std::vector<iSS_Hadron> &sample) {
+void FSSW::prepare_workers() {
+    int n_threads = 1;
+#ifdef _OPENMP
+    n_threads = std::max(1, omp_get_max_threads());
+#endif
+    workers_.clear();
+    workers_.resize(n_threads);
+    workers_[0].reset(new SamplerWorker);
+    workers_[0]->ran_gen = ran_gen_ptr;
+    workers_[0]->momentum_sampler = momentum_sampler_ptr_;
+    workers_[0]->decayer = decayer_ptr_.get();
+    if (n_threads == 1) return;
+    const long seed = ran_gen_ptr->get_seed();
+    const bool decays = flag_perform_decays_;
+    // each thread builds its own (the decayer reads its table)
+    #pragma omp parallel num_threads(n_threads)
+    {
+#ifdef _OPENMP
+        const int it = omp_get_thread_num();
+#else
+        const int it = 0;
+#endif
+        if (it > 0) {
+            std::unique_ptr<SamplerWorker> w(new SamplerWorker);
+            w->ran_gen = std::make_shared<RandomUtil::Random>(seed);
+            w->momentum_sampler = std::make_shared<MomentumSamplerShell>(
+                                                                w->ran_gen);
+            if (decays) {
+                w->own_decayer.reset(new particle_decay(
+                            w->ran_gen, afterburner_type_, table_path_));
+                w->decayer = w->own_decayer.get();
+            }
+            workers_[it] = std::move(w);
+        }
+    }
+    for (const auto &w : workers_) {
+        if (!w) {
+            // fewer threads than asked for (e.g. a nested parallel region):
+            // one thread
+            workers_.resize(1);
+            break;
+        }
+    }
+}
+
+
+void FSSW::release_workers() {
+    for (size_t i = 1; i < workers_.size(); i++) {
+        if (workers_[i] && workers_[i]->own_decayer && decayer_ptr_) {
+            decayer_ptr_->add_counters(*workers_[i]->own_decayer);
+        }
+    }
+    workers_.clear();
+    std::vector<ItemOutput>().swap(item_output_);
+}
+
+
+void FSSW::decay_one_primary(SamplerWorker &w, const iSS_Hadron &primary,
+                             const int isample, BlockSink &sink) {
 // perform_resonance_feed_down for one primary: its whole decay chain
-    std::vector<iSS_Hadron> &chain = decay_chain_;
-    std::vector<iSS_Hadron> &daughters = decay_daughters_;
+    std::vector<iSS_Hadron> &chain = w.decay_chain;
+    std::vector<iSS_Hadron> &daughters = w.decay_daughters;
     chain.assign(1, primary);
     for (size_t ipart = 0; ipart < chain.size(); ipart++) {
         iSS_Hadron mother = chain[ipart];
         daughters.clear();
-        if (!decayer_ptr_->perform_decays(&mother, &daughters)) {
-            sample.push_back(mother);       // no channel open at its mass
+        if (!w.decayer->perform_decays(&mother, &daughters)) {
+            sink.hadron(isample, mother);   // no channel open at its mass
             continue;
         }
         for (auto &daughter : daughters) {
-            if (decayer_ptr_->check_particle_stable(&daughter) == 1) {
-                sample.push_back(daughter);
+            if (w.decayer->check_particle_stable(&daughter) == 1) {
+                sink.hadron(isample, daughter);
             } else {
                 chain.push_back(daughter);
             }
@@ -1565,105 +1680,204 @@ void FSSW::decay_one_primary(const iSS_Hadron &primary,
 
 
 void FSSW::sample_one_species_correlated(const int real_particle_idx,
-                                         const double *dN_cell) {
+                                         const double *dN_cell,
+                                         const double *block_yields) {
     const particle_info *particle = &particles[real_particle_idx];
-    const double mass = particle->mass;
-    const int sign    = particle->sign;
-    const int baryon  = particle->baryon;
-    const int strange = particle->strange;
-    const int charge  = particle->charge;
     const bool decays = decays_on();
     const int n_keep = static_cast<int>(primary_list_.size());
 
     const uint32_t seed = static_cast<uint32_t>(ran_gen_ptr->get_seed());
-    const uint32_t species = static_cast<uint32_t>(particle->monval);
-    const int n_samples = number_of_repeated_sampling;
     const double y_LB = paraRdr->getVal("y_LB");
     const double y_RB = paraRdr->getVal("y_RB");
     // (3+1)-d: dN_dxtdy is the cell's yield; (2+1)-d: per unit rapidity
     const double y_factor = (hydro_mode != 2) ? (y_RB - y_LB) : 1.0;
 
-    std::vector<double> visCoeffs_local;
-    std::vector<double> block_cdf;
     const long n_blocks = static_cast<long>(block_word_.size());
-    for (long b = 0; b < n_blocks; b++) {
-        const long j0 = block_start_[b];
-        const long n_cells = block_start_[b + 1] - j0;
-        block_cdf.resize(n_cells);
-        double block_yield = 0.;
-        for (long j = 0; j < n_cells; j++) {
-            block_yield += dN_cell[block_order_[j0 + j]];
-            block_cdf[j] = block_yield;
-        }
-        if (block_yield <= 0.) continue;
-        const uint32_t w0 = block_word_[b][0], w1 = block_word_[b][1];
-
-        ran_gen_ptr->set_stream(seed, species, w0, w1, kPhiloxMultiplicity);
-        const long n_hadrons = RandomUtil::poisson_inverse(
-            ran_gen_ptr->rand_uniform(), n_samples*y_factor*block_yield);
-        if (n_hadrons > static_cast<long>(kPhiloxIndexMask)) {
-            messager_ << "correlated sampling: " << n_hadrons
-                      << " hadrons in one block, too many to address";
-            messager_.flush("error");
-            exit(1);
-        }
-
-        for (long i = 0; i < n_hadrons; i++) {
-            ran_gen_ptr->set_stream(seed, species, w0, w1,
-                                    kPhiloxHadron | static_cast<uint32_t>(i));
-            const int isample = std::min(
-                n_samples - 1,
-                static_cast<int>(n_samples*ran_gen_ptr->rand_uniform()));
-            const FO_surf_LRF *surf = nullptr;
-            double pT, phi, y_minus_eta_s;
-            int status = 0;
-            while (status == 0) {
-                // the cell, within the block
-                const double r = block_yield*ran_gen_ptr->rand_uniform();
-                long j = std::upper_bound(block_cdf.begin(), block_cdf.end(), r)
-                         - block_cdf.begin();
-                j = std::min(j, n_cells - 1);
-                const long FO_idx = block_order_[j0 + j];
-                surf = &FOsurf_ptr[FO_idx];
-
-                const double *visCoefficients;
-                if (cellVisCoeffsReady_) {
-                    visCoefficients = &cellVisCoeffs_[FO_idx*kMaxVisCoeffs_];
-                } else {
-                    getCellVisCoefficients(surf, visCoeffs_local);
-                    visCoefficients = visCoeffs_local.data();
-                }
-                double deltaf_qmu_coeff = 1.0;
-                if (bINCLUDE_DIFFUSION_DELTAF)
-                    deltaf_qmu_coeff = get_deltaf_qmu_coeff(surf->Tdec,
-                                                            surf->muB);
-                status = sample_momemtum_from_a_fluid_cell(
-                                mass, sign, baryon, strange, charge,
-                                surf, visCoefficients, deltaf_qmu_coeff,
-                                pT, phi, y_minus_eta_s);
-            }
-
-            double eta_s = surf->eta;
-            if (hydro_mode != 2) {
-                double rap = y_LB + (y_RB - y_LB)*ran_gen_ptr->rand_uniform();
-                eta_s = rap - y_minus_eta_s;
-            }
-            const iSS_Hadron primary = make_sampled_particle(
-                surf, particle->monval, mass, pT, phi, y_minus_eta_s, eta_s);
-            std::vector<iSS_Hadron> &sample = *(*Hadron_list)[isample];
-            if (isample < n_keep) {
-                primary_list_[isample].push_back(primary);
-            }
-            if (decays) {
-                ran_gen_ptr->set_stream(seed, species, w0, w1,
-                                        kPhiloxDecay | static_cast<uint32_t>(i));
-                decay_one_primary(primary, sample);
-            } else {
-                sample.push_back(primary);
-            }
+    {
+        // one thread: the hadrons go straight into the samples
+        BlockSink sink;
+        sink.samples = Hadron_list;
+        sink.primaries = &primary_list_;
+        for (long b = 0; b < n_blocks; b++) {
+            sample_block_correlated(*workers_[0], sink, particle, dN_cell,
+                                    block_yields[b], b,
+                                    seed, n_keep, decays, y_LB, y_RB,
+                                    y_factor);
         }
     }
     ran_gen_ptr->unset_stream();
+}
+
+
+void FSSW::sample_species_group_correlated(
+        const std::vector<int> &species_idx, const double *dN_group) {
+// sample_one_species_correlated for a group of species on several threads
+    const int n_species = static_cast<int>(species_idx.size());
+    const bool decays = decays_on();
+    const int n_keep = static_cast<int>(primary_list_.size());
+    const uint32_t seed = static_cast<uint32_t>(ran_gen_ptr->get_seed());
+    const double y_LB = paraRdr->getVal("y_LB");
+    const double y_RB = paraRdr->getVal("y_RB");
+    const double y_factor = (hydro_mode != 2) ? (y_RB - y_LB) : 1.0;
+
+    const long n_blocks = static_cast<long>(block_word_.size());
+    const long n_chunks = (n_blocks + kBlocksPerItem_ - 1)/kBlocksPerItem_;
+    const long n_items = n_species*n_chunks;
+    item_output_.resize(n_items);
+    const int n_workers = static_cast<int>(workers_.size());
+    for (auto &w : workers_) {
+        w->sink.hadrons.clear();
+        w->sink.kept.clear();
+    }
+
+    std::atomic<long> next_item(0);
+    #pragma omp parallel num_threads(n_workers)
+    {
+#ifdef _OPENMP
+        const int it = omp_get_thread_num();
+#else
+        const int it = 0;
+#endif
+        SamplerWorker &w = *workers_[it];
+        for (;;) {
+            const long k = next_item.fetch_add(1, std::memory_order_relaxed);
+            if (k >= n_items) break;
+            const int s = static_cast<int>(k/n_chunks);
+            const long b0 = (k % n_chunks)*kBlocksPerItem_;
+            const long b1 = std::min(n_blocks, b0 + kBlocksPerItem_);
+            const particle_info *particle = &particles[species_idx[s]];
+            const double *dN_cell = dN_group + s*FO_length;
+            const double *yields = &block_yield_[s*n_blocks];
+            ItemOutput &out = item_output_[k];
+            out.thread = it;
+            out.h0 = w.sink.hadrons.size();
+            out.k0 = w.sink.kept.size();
+            for (long b = b0; b < b1; b++) {
+                sample_block_correlated(w, w.sink, particle, dN_cell,
+                                        yields[b], b,
+                                        seed, n_keep, decays, y_LB, y_RB,
+                                        y_factor);
+            }
+            out.h1 = w.sink.hadrons.size();
+            out.k1 = w.sink.kept.size();
+        }
+    }
+
+    // in (species, block) order, as one thread would have appended them
+    for (long k = 0; k < n_items; k++) {
+        const ItemOutput &out = item_output_[k];
+        const BlockSink &sink = workers_[out.thread]->sink;
+        for (size_t i = out.k0; i < out.k1; i++) {
+            primary_list_[sink.kept[i].first].push_back(sink.kept[i].second);
+        }
+        for (size_t i = out.h0; i < out.h1; i++) {
+            (*Hadron_list)[sink.hadrons[i].first]->push_back(
+                                                    sink.hadrons[i].second);
+        }
+    }
+    ran_gen_ptr->unset_stream();
+}
+
+
+void FSSW::sample_block_correlated(SamplerWorker &w, BlockSink &sink_in,
+                                   const particle_info *particle,
+                                   const double *dN_cell,
+                                   const double block_yield, const long b,
+                                   const uint32_t seed, const int n_keep,
+                                   const bool decays, const double y_LB,
+                                   const double y_RB, const double y_factor) {
+    const double mass = particle->mass;
+    const int sign    = particle->sign;
+    const int baryon  = particle->baryon;
+    const int strange = particle->strange;
+    const int charge  = particle->charge;
+    const uint32_t species = static_cast<uint32_t>(particle->monval);
+    const int n_samples = number_of_repeated_sampling;
+    BlockSink &sink = sink_in;
+    RandomUtil::Random &ran_gen = *w.ran_gen;
+    std::vector<double> &block_cdf = w.block_cdf;
+
+    const long j0 = block_start_[b];
+    const long n_cells = block_start_[b + 1] - j0;
+    // the yields are in block order (cell_order_): the block's are
+    // dN_cell[j0, j0 + n_cells); block_yield is their sum in the cells'
+    // order (calculate_dN_dxtdy_for_species_block)
+    const double *dN_block = dN_cell + j0;
+    if (block_yield <= 0.) return;
+    const uint32_t w0 = block_word_[b][0], w1 = block_word_[b][1];
+
+    ran_gen.set_stream(seed, species, w0, w1, kPhiloxMultiplicity);
+    const long n_hadrons = RandomUtil::poisson_inverse(
+        ran_gen.rand_uniform(), n_samples*y_factor*block_yield);
+    if (n_hadrons == 0) return;
+    // the running sum again, the same additions in the same order
+    block_cdf.resize(n_cells);
+    double running = 0.;
+    for (long j = 0; j < n_cells; j++) {
+        running += dN_block[j];
+        block_cdf[j] = running;
+    }
+    if (n_hadrons > static_cast<long>(kPhiloxIndexMask)) {
+        std::cerr << "correlated sampling: " << n_hadrons
+                  << " hadrons in one block, too many to address" << std::endl;
+        exit(1);
+    }
+
+    for (long i = 0; i < n_hadrons; i++) {
+        ran_gen.set_stream(seed, species, w0, w1,
+                           kPhiloxHadron | static_cast<uint32_t>(i));
+        const int isample = std::min(
+            n_samples - 1,
+            static_cast<int>(n_samples*ran_gen.rand_uniform()));
+        const FO_surf_LRF *surf = nullptr;
+        double pT, phi, y_minus_eta_s;
+        int status = 0;
+        while (status == 0) {
+            // the cell, within the block
+            const double r = block_yield*ran_gen.rand_uniform();
+            long j = std::upper_bound(block_cdf.begin(), block_cdf.end(), r)
+                     - block_cdf.begin();
+            j = std::min(j, n_cells - 1);
+            const long FO_idx = block_order_[j0 + j];
+            surf = &FOsurf_ptr[FO_idx];
+
+            const double *visCoefficients;
+            if (cellVisCoeffsReady_) {
+                // (in block order, as the yields)
+                visCoefficients = &cellVisCoeffs_[(j0 + j)*kMaxVisCoeffs_];
+            } else {
+                getCellVisCoefficients(surf, w.visCoeffs_local);
+                visCoefficients = w.visCoeffs_local.data();
+            }
+            double deltaf_qmu_coeff = 1.0;
+            if (bINCLUDE_DIFFUSION_DELTAF)
+                deltaf_qmu_coeff = get_deltaf_qmu_coeff(surf->Tdec,
+                                                        surf->muB);
+            status = sample_momemtum_from_a_fluid_cell(
+                            ran_gen, *w.momentum_sampler,
+                            mass, sign, baryon, strange, charge,
+                            surf, visCoefficients, deltaf_qmu_coeff,
+                            pT, phi, y_minus_eta_s);
+        }
+
+        double eta_s = surf->eta;
+        if (hydro_mode != 2) {
+            double rap = y_LB + (y_RB - y_LB)*ran_gen.rand_uniform();
+            eta_s = rap - y_minus_eta_s;
+        }
+        const iSS_Hadron primary = make_sampled_particle(
+            surf, particle->monval, mass, pT, phi, y_minus_eta_s, eta_s);
+        if (isample < n_keep) {
+            sink.primary(isample, primary);
+        }
+        if (decays) {
+            ran_gen.set_stream(seed, species, w0, w1,
+                               kPhiloxDecay | static_cast<uint32_t>(i));
+            decay_one_primary(w, primary, isample, sink);
+        } else {
+            sink.hadron(isample, primary);
+        }
+    }
 }
 
 
@@ -2448,6 +2662,8 @@ double FSSW::get_deltaf_bulk(
 
 
 int FSSW::sample_momemtum_from_a_fluid_cell(
+        RandomUtil::Random &ran_gen,
+        const MomentumSamplerShell &momentum_sampler,
         const double mass, const int sign,
         const int baryon, const int strange, const int charge,
         const FO_surf_LRF *surf,
@@ -2473,10 +2689,10 @@ int FSSW::sample_momemtum_from_a_fluid_cell(
         // the rate is calculated
         // Basically it is "just Cooper-Frye"
 
-        double p_mag = momentum_sampler_ptr_->Sample_a_momentum(mass, Tdec, mu,
+        double p_mag = momentum_sampler.Sample_a_momentum(mass, Tdec, mu,
                                                                 sign);
-        double phi_candidate = 2*M_PI*ran_gen_ptr->rand_uniform();
-        double cos_theta = 2.*ran_gen_ptr->rand_uniform() - 1.;
+        double phi_candidate = 2*M_PI*ran_gen.rand_uniform();
+        double cos_theta = 2.*ran_gen.rand_uniform() - 1.;
         double sin_theta = sqrt(1. - cos_theta*cos_theta);
         double pT_candidate = p_mag*sin_theta;
 
@@ -2540,7 +2756,7 @@ int FSSW::sample_momemtum_from_a_fluid_cell(
         fact2 = std::max(0., std::min(1., fact2));
         double accept_prob = fact1*fact2;
 
-        if (ran_gen_ptr->rand_uniform() < accept_prob) {
+        if (ran_gen.rand_uniform() < accept_prob) {
             // accept the sample
             // now we need to boost the momentum to the lab frame
             VecD4 pLRF = {p0, px, py, pz};

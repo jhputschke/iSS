@@ -896,15 +896,18 @@ void read_FOdata::read_FOsurfdat_MUSIC(std::vector<FO_surf> &surf_ptr,
 
 
 void read_FOdata::regulate_surface_cells(std::vector<FO_surf> &surf_ptr) {
-    double pi_init[4][4];
-    double pi_reg[4][4];
-    double u_flow[4];
-
     if (regulateEOS_) {
         messager.info("Regulate local temperature with pure HRG EoS.");
     }
 
-    for (auto &surf_i: surf_ptr) {
+    // every cell on its own: in parallel, the same arithmetic per cell
+    const long n_cells = static_cast<long>(surf_ptr.size());
+    #pragma omp parallel for schedule(static)
+    for (long icell = 0; icell < n_cells; icell++) {
+        FO_surf &surf_i = surf_ptr[icell];
+        double pi_init[4][4];
+        double pi_reg[4][4];
+        double u_flow[4];
         if (regulateEOS_) {
             std::vector<float> eosVar;    // {P, T, muB, muS, muQ}
             std::vector<double> visCoefficients;
@@ -1497,9 +1500,12 @@ int read_FOdata::getValuesFromHRGEOS(const double ed, const double nB,
     double HRGEOS_e0 = HRGEOS_[0][0];
     int e_idx = static_cast<int>((ed - HRGEOS_e0)/HRGEOS_de);
     if (e_idx < 0 || e_idx >= static_cast<int>(HRGEOS_.size()/nBlen) - 2) {
+        #pragma omp critical(iss_messager)
+        {
         messager << "ed is out of range: ed = " << ed << " GeV/fm^3. ";
         messager << "Can not regulate this fluid cell!";
         messager.flush("warning");
+        }
         return(-1);
     }
     int e_idx1 = e_idx*nBlen;
@@ -1562,9 +1568,12 @@ int read_FOdata::getValuesFromHRGEOS3D(const double ed, const double nB,
     int e_idx = static_cast<int>((ed - HRGEOS_e0)/HRGEOS_de);
     if (e_idx < 0
             || e_idx > static_cast<int>(HRGEOS_.size()/(nBlen*nQlen)) - 2) {
+        #pragma omp critical(iss_messager)
+        {
         messager << "ed is out of range: ed = " << ed << " GeV/fm^3. ";
         messager << "Can not regulate this fluid cell!";
         messager.flush("warning");
+        }
         return(-1);
     }
 

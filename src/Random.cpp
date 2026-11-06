@@ -5,6 +5,7 @@
 #include <gsl/gsl_cdf.h>
 
 #include <cmath>
+#include <math.h>   // lgamma_r (glibc)
 
 namespace RandomUtil {
 
@@ -18,13 +19,29 @@ Random::Random(long seed_in, double min, double max) :
 }
 
 
+namespace {
+
+//! lgamma without the global signgam: glibc's lgamma() stores the sign there,
+//! and threads calling it at once (correlated sampling) all write that one
+//! cache line. lgamma_r is the same computation with the sign in a local.
+inline double lgamma_no_signgam(const double x) {
+#if defined(__GLIBC__)
+    int sign;
+    return ::lgamma_r(x, &sign);
+#else
+    return std::lgamma(x);
+#endif
+}
+
+}  // namespace
+
 long poisson_inverse(const double u, const double lambda) {
 // The smallest k with P(k; lambda) >= u: monotonic in u and continuous in
 // lambda, so the same u gives the same k for nearly equal lambdas.
     if (lambda <= 0.) return 0;
     const long mode = static_cast<long>(lambda);
     double p_k = std::exp(-lambda + mode*std::log(lambda)
-                          - std::lgamma(mode + 1.));
+                          - lgamma_no_signgam(mode + 1.));
     double cdf_k = (mode == 0) ? p_k : gsl_cdf_poisson_P(mode, lambda);
     long k = mode;
     if (u <= cdf_k) {

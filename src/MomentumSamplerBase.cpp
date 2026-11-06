@@ -8,6 +8,7 @@
 #include "MomentumSamplerBase.h"
 
 MomentumSamplerBase::MomentumSamplerBase() : tol_(1e-8), eps_(1e-16),
+    m_minus_mu_tilde_(std::numeric_limits<double>::quiet_NaN()),
     CDFc_m_tilde_(std::numeric_limits<double>::quiet_NaN()),
     CDFc_mu_tilde_(std::numeric_limits<double>::quiet_NaN()),
     CDFc_m_minus_mu_tilde_(std::numeric_limits<double>::quiet_NaN()) {}
@@ -48,7 +49,10 @@ double MomentumSamplerBase::Sample_a_momentum(double m, double T, double mu) {
     T = std::max(eps_, T);
     const double m_tilde = m/T;
     const double mu_tilde = mu/T;
-    if (std::abs((m_tilde - mu_tilde) - m_minus_mu_tilde_) > tol_)
+    // the CDFs at (m - mu)/T, kept while (m - mu)/T stays exactly the same
+    // (not within a tolerance: then the values would depend on the hadron
+    // sampled before, and with several threads on the thread)
+    if (!((m_tilde - mu_tilde) == m_minus_mu_tilde_))
         update_cache(m_tilde - mu_tilde);
     double m_term = (CDF_2_mtilde_ + 2.*mu_tilde*CDF_1_mtilde_
                      + (mu_tilde*mu_tilde - m_tilde*m_tilde/2.)*CDF_0_mtilde_);

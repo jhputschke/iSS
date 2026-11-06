@@ -83,7 +83,9 @@ class FSSW {
     // the inverse CDF over the cells, reused from species to species
     std::vector<double> invCDF_storage_;
 
-    // the decay chain of one primary (decay_one_primary), reused
+    // (unused: the decay chains are per thread now, SamplerWorker; kept so
+    // that the members below keep their offsets for code built against the
+    // earlier header)
     std::vector<iSS_Hadron> decay_chain_, decay_daughters_;
 
     // correlated sampling (correlated_sampling = 1): the random numbers are
@@ -218,7 +220,8 @@ class FSSW {
     void calculate_dN_dxtdy_for_one_particle_species(const int particle_idx);
     void calculate_dN_dxtdy_for_species_block(
                 const std::vector<int> &species_idx,
-                double *__restrict__ dN_out);
+                double *__restrict__ dN_out,
+                double *block_yield_out = nullptr);
     void sample_using_dN_dxtdy_4all_particles_conventional();
     void sample_one_species_conventional(const int real_particle_idx,
                                          const double *dN_cell);
@@ -226,9 +229,63 @@ class FSSW {
     void prepare_cell_blocks();
     void release_cell_blocks();
     void sample_one_species_correlated(const int real_particle_idx,
-                                       const double *dN_cell);
-    void decay_one_primary(const iSS_Hadron &primary,
-                           std::vector<iSS_Hadron> &sample);
+                                       const double *dN_cell,
+                                       const double *block_yields);
+
+    //! Correlated sampling on several threads (OpenMP). Every draw is
+    //! addressed by (seed, species, block, hadron) in a Philox stream, so a
+    //! block's hadrons do not depend on the thread that samples it. The
+    //! (species, chunk of blocks) items of a group of species are shared out
+    //! among the threads; each thread appends to a buffer of its own, and
+    //! the items are then appended to the samples in (species, block) order,
+    //! as one thread would have: the output is the same for any number of
+    //! threads. Each thread has its own generator, momentum sampler and
+    //! decayer (they hold the generator and caches) and scratch vectors;
+    //! worker 0 uses the sampler's own.
+
+    //! where a block's hadrons go: straight into the samples (one thread),
+    //! or into a thread's buffer (several threads)
+    struct BlockSink {
+        std::vector<std::vector<iSS_Hadron>*> *samples = nullptr;
+        std::vector<std::vector<iSS_Hadron>> *primaries = nullptr;
+        std::vector<std::pair<int, iSS_Hadron>> hadrons, kept;
+        void hadron(const int isample, const iSS_Hadron &h) {
+            if (samples) (*samples)[isample]->push_back(h);
+            else hadrons.emplace_back(isample, h);
+        }
+        void primary(const int isample, const iSS_Hadron &h) {
+            if (primaries) (*primaries)[isample].push_back(h);
+            else kept.emplace_back(isample, h);
+        }
+    };
+    struct SamplerWorker {
+        std::shared_ptr<RandomUtil::Random> ran_gen;
+        std::shared_ptr<MomentumSamplerShell> momentum_sampler;
+        particle_decay *decayer = nullptr;
+        std::unique_ptr<particle_decay> own_decayer;
+        std::vector<iSS_Hadron> decay_chain, decay_daughters;
+        std::vector<double> visCoeffs_local, block_cdf;
+        BlockSink sink;   // this thread's buffer
+    };
+    //! one (species, chunk of blocks) item: whose buffer, which entries
+    struct ItemOutput {
+        int thread;
+        size_t h0, h1, k0, k1;
+    };
+    static const long kBlocksPerItem_ = 64;
+    void prepare_workers();
+    void release_workers();
+    void sample_species_group_correlated(const std::vector<int> &species_idx,
+                                         const double *dN_group);
+    void sample_block_correlated(SamplerWorker &w, BlockSink &sink,
+                                 const particle_info *particle,
+                                 const double *dN_cell,
+                                 const double block_yield, const long b,
+                                 const uint32_t seed, const int n_keep,
+                                 const bool decays, const double y_LB,
+                                 const double y_RB, const double y_factor);
+    void decay_one_primary(SamplerWorker &w, const iSS_Hadron &primary,
+                           const int isample, BlockSink &sink);
 
     void getCellVisCoefficients(const FO_surf_LRF *surf,
                                 std::vector<double> &visCoefficients);
@@ -292,6 +349,21 @@ class FSSW {
         const FO_surf_LRF *surf,
         const double *visCoefficients,
         const double deltaf_qmu_coeff,
+        double &pT, double &phi, double &y_minus_eta_s) {
+        return sample_momemtum_from_a_fluid_cell(
+            *ran_gen_ptr, *momentum_sampler_ptr_, mass, sign, baryon,
+            strange, charge, surf, visCoefficients, deltaf_qmu_coeff,
+            pT, phi, y_minus_eta_s);
+    }
+    //! the same with a given generator and momentum sampler (one thread's)
+    int sample_momemtum_from_a_fluid_cell(
+        RandomUtil::Random &ran_gen,
+        const MomentumSamplerShell &momentum_sampler,
+        const double mass, const int sign,
+        const int baryon, const int strange, const int charge,
+        const FO_surf_LRF *surf,
+        const double *visCoefficients,
+        const double deltaf_qmu_coeff,
         double &pT, double &phi, double &y_minus_eta_s);
     iSS_Hadron make_sampled_particle(
         const FO_surf_LRF *surf, const int particle_monval, const double mass,
@@ -309,6 +381,23 @@ class FSSW {
                           int idx_e1, int idx_e2, int idx_nB1, int idx_nB2,
                           double x_fraction, double y_fraction);
     int getParticleInfo(const int monval) const;
+
+ private:
+    // (last, so that the members above keep their offsets for code built
+    // against the earlier header)
+    std::vector<std::unique_ptr<SamplerWorker>> workers_;
+    std::vector<ItemOutput> item_output_;
+    //! correlated sampling: the yield of every (species s of the current
+    //! group, block b) at [s*n_blocks + b], summed in the cells' order
+    std::vector<double> block_yield_;
+    //! correlated sampling: the per-cell arrays (delta f coefficients, yield
+    //! inputs, yields) are kept in block order, position j holding cell
+    //! cell_order_[j] (block_order_), so that a block's cells are
+    //! contiguous; nullptr: in the surface's order
+    const long *cell_order_ = nullptr;
+    long cell_at(const long l) const {
+        return cell_order_ ? cell_order_[l] : l;
+    }
 };
 
 #endif  // SRC_FSSW_H_

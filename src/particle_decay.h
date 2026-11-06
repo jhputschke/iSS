@@ -92,6 +92,12 @@ class particle_decay {
     long get_n_closed_at_pole() const { return n_closed_at_pole_; }
     long get_n_redrawn() const { return n_redrawn_; }
     long get_n_undecayed() const { return n_undecayed_; }
+    //! adds another decayer's counters (one thread's, in parallel sampling)
+    void add_counters(const particle_decay &other) {
+        n_closed_at_pole_ += other.n_closed_at_pole_;
+        n_redrawn_ += other.n_redrawn_;
+        n_undecayed_ += other.n_undecayed_;
+    }
 
 
     //! This function perform two body decay
