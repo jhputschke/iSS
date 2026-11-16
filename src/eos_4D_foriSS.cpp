@@ -6,9 +6,42 @@
 #include <sstream>
 #include <fstream>
 #include <cmath>
+#include <algorithm>
+#include <map>
+#include <memory>
+#include <mutex>
 
 using std::stringstream;
 using std::string;
+
+namespace {
+// The 4D tables are read once per process: iSS builds a new EOS_4D_foriSS
+// for every surface it samples (twice, in read_FOdata and in FSSW), and a
+// time-stepped run (X-SCAPE's SMASH initial condition) samples tens of
+// surfaces per event, each reading ~165 MB float by float. The cache keeps
+// each file's floats as read, so the tables are the same as before.
+std::mutex table_cache_mutex;
+
+//! all floats of a binary file, read once per process (nullptr if the file
+//! cannot be opened)
+std::shared_ptr<const std::vector<float>> cached_file_floats(
+        const std::string &filepath) {
+    static std::map<std::string, std::shared_ptr<const std::vector<float>>> cache;
+    std::lock_guard<std::mutex> lock(table_cache_mutex);
+    auto it = cache.find(filepath);
+    if (it != cache.end()) return it->second;
+    std::ifstream ifs(filepath, std::ios::in | std::ios::binary | std::ios::ate);
+    if (!ifs.is_open()) return nullptr;
+    const std::streamsize bytes = ifs.tellg();
+    ifs.seekg(0);
+    auto data = std::make_shared<std::vector<float>>(
+                    static_cast<size_t>(bytes) / sizeof(float));
+    ifs.read(reinterpret_cast<char*>(data->data()),
+             static_cast<std::streamsize>(data->size() * sizeof(float)));
+    cache[filepath] = data;
+    return data;
+}
+}  // namespace
 
 EOS_4D_foriSS::EOS_4D_foriSS() {}
 
@@ -44,50 +77,53 @@ void EOS_4D_foriSS::read_header_binary(std::string filepath, int header_size) {
 
 void EOS_4D_foriSS::read_eos_binary(std::string filepath,
                              std::vector<float> &out, int header_size) {
-    std::ifstream eos_binary_file(filepath, std::ios::in | std::ios::binary);
-
-    if (!eos_binary_file.is_open()) {
+    auto data = cached_file_floats(filepath);
+    if (!data) {
         messenger << "Can not open EOS file: "<< filepath;
         messenger.flush("error");
         exit(1);
-    } else {
-        float number;
-        while (eos_binary_file.read(reinterpret_cast<char*>(&number),
-                sizeof(float))) {
-            out.push_back(number);
-        }
-        eos_binary_file.close();
-
-        // remove header
-        out.erase(out.begin(), out.begin() + header_size);
-        out.resize(out.size());
     }
+    // the file's floats after the header
+    out.assign(data->begin() + std::min<size_t>(header_size, data->size()),
+               data->end());
 }
 
 
 void EOS_4D_foriSS::read_dfCoeffs_binary(std::string filepath, const int dfType) {
     dfCoeffs_.clear();
-    std::ifstream df_binary_file(filepath, std::ios::in | std::ios::binary);
-
-    if (!df_binary_file.is_open()) {
-        messenger << "Can not open deltaf coeffs file: "<< filepath;
-        messenger.flush("error");
-        exit(1);
-    }
-
     int numCoeffs = 6;
     if (dfType == 1) {
         numCoeffs = 3;
     }
-    dfCoeffs_.resize(numCoeffs);
-    int counter = 0;
-    float number;
-    while (df_binary_file.read(reinterpret_cast<char*>(&number),
-                               sizeof(float))) {
-        dfCoeffs_[counter%numCoeffs].push_back(number);
-        counter++;
+    // the coefficients split by component, once per (file, dfType)
+    static std::map<std::string,
+                    std::shared_ptr<const std::vector<std::vector<float>>>> split;
+    const std::string key = filepath + "#" + std::to_string(numCoeffs);
+    std::shared_ptr<const std::vector<std::vector<float>>> coeffs;
+    {
+        std::lock_guard<std::mutex> lock(table_cache_mutex);
+        auto it = split.find(key);
+        if (it != split.end()) coeffs = it->second;
     }
-    df_binary_file.close();
+    if (!coeffs) {
+        auto data = cached_file_floats(filepath);
+        if (!data) {
+            messenger << "Can not open deltaf coeffs file: "<< filepath;
+            messenger.flush("error");
+            exit(1);
+        }
+        auto c = std::make_shared<std::vector<std::vector<float>>>(numCoeffs);
+        for (int k = 0; k < numCoeffs; k++) {
+            (*c)[k].reserve(data->size() / numCoeffs + 1);
+        }
+        for (size_t i = 0; i < data->size(); i++) {
+            (*c)[i % numCoeffs].push_back((*data)[i]);
+        }
+        std::lock_guard<std::mutex> lock(table_cache_mutex);
+        split[key] = c;
+        coeffs = c;
+    }
+    dfCoeffs_ = *coeffs;
 }
 
 
