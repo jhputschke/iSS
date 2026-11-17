@@ -107,6 +107,10 @@ void iSS::getSurfaceCellFromJETSCAPE(std::vector<FO_surf> &FOsurf_arr) {
     FOsurf_LRF_array_.clear();
 
     echoLevel_ = paraRdr_ptr->getVal("JSechoLevel", 1);
+    // read here, not only in the constructor: a caller (X-SCAPE's iSS
+    // wrapper) sets the parameters after constructing iSS, and with the
+    // constructor's value a Cartesian surface was boosted as a Milne one
+    hydro_Cartesian = paraRdr_ptr->getVal("hydro_Cartesian", 0);
     read_FOdata freeze_out_data(paraRdr_ptr, path_, table_path_,
                                 particle_table_path_);
     messager << "total number of cells: " <<  FOsurf_arr.size();
@@ -139,6 +143,10 @@ void iSS::getSurfaceCellFromJETSCAPE(std::vector<FO_surf> &FOsurf_arr) {
 
 int iSS::read_in_FO_surface() {
     echoLevel_ = paraRdr_ptr->getVal("JSechoLevel", 1);
+    // read here, not only in the constructor: a caller (X-SCAPE's iSS
+    // wrapper) sets the parameters after constructing iSS, and with the
+    // constructor's value a Cartesian surface was boosted as a Milne one
+    hydro_Cartesian = paraRdr_ptr->getVal("hydro_Cartesian", 0);
     std::vector<FO_surf> FOsurf_temp;
     read_FOdata freeze_out_data(paraRdr_ptr, path_, table_path_,
                                 particle_table_path_);
