@@ -79,6 +79,9 @@ class FSSW {
     // the yields of a block of species from one pass over the cells,
     // dN_block_[s*FO_length + l]
     static const int kSpeciesBlock_ = 8;
+    //! uncorrelated sampling: all species in one block when their yields on
+    //! the surface take at most this many bytes
+    static constexpr double kAllSpeciesBytes_ = 256.*1024.*1024.;
     std::vector<double> dN_block_;
 
     // the inverse CDF over the cells, reused from species to species

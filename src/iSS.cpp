@@ -40,6 +40,11 @@ void iSS::clear() {
     FOsurf_array_.clear();
     FOsurf_LRF_array_.clear();
     FOsurf_Tmunu_.clear();
+    release_particles();
+}
+
+
+void iSS::release_particles() {
     // the decay channels are allocated by read_FOdata::read_resonances_list
     // and owned here; the copies in the samplers do not use them
     for (auto &particle_i : particle_) {
@@ -121,6 +126,11 @@ void iSS::getSurfaceCellFromJETSCAPE(std::vector<FO_surf> &FOsurf_arr) {
     }
 
     afterburner_type_ = freeze_out_data.get_afterburner_type();
+    // the list is read again for every surface: without this, a run that
+    // hands over many surfaces (X-SCAPE's time-stepped particlization)
+    // appended a full copy each time, and the samplers' species lookups and
+    // the memory grew with the number of surfaces
+    release_particles();
     freeze_out_data.read_in_chemical_potentials(FOsurf_arr, particle_);
     flag_PCE_ = freeze_out_data.get_flag_PCE();
 
@@ -162,6 +172,7 @@ int iSS::read_in_FO_surface() {
     }
 
     afterburner_type_ = freeze_out_data.get_afterburner_type();
+    release_particles();   // read again (see getSurfaceCellFromJETSCAPE)
     freeze_out_data.read_in_chemical_potentials(FOsurf_temp, particle_);
     flag_PCE_ = freeze_out_data.get_flag_PCE();
 

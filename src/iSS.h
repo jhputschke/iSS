@@ -36,6 +36,9 @@ class iSS {
     long randomSeed_;
 
     std::vector<particle_info> particle_;
+    //! the resonance list and its decay channels, before it is read again
+    //! (read_FOdata::read_resonances_list appends to it)
+    void release_particles();
 
     std::unique_ptr<EmissionFunctionArray> efa_;
     std::unique_ptr<FSSW> spectra_sampler_;

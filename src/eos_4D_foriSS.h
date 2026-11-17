@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <array>
+#include <memory>
 #include <vector>
 
 #include "pretty_ostream.h"
@@ -29,18 +30,21 @@ class EOS_4D_foriSS {
 
     const double hbarc3 = 0.19733*0.19733*0.19733;
 
-    // 1D tables.
-    std::vector<float> pressure_vec;
-    std::vector<float> temp_vec;
-    std::vector<float> mub_vec;
-    std::vector<float> muq_vec;
-    std::vector<float> mus_vec;
+    // 1D tables: shared with every other EOS_4D_foriSS of the process,
+    // read-only (the per-process cache of the .cpp; a copy per object cost
+    // ~20 ms per surface in time-stepped running)
+    using FloatTable = std::shared_ptr<const std::vector<float>>;
+    FloatTable pressure_vec;
+    FloatTable temp_vec;
+    FloatTable mub_vec;
+    FloatTable muq_vec;
+    FloatTable mus_vec;
 
-    std::vector<std::vector<float>> dfCoeffs_;
+    std::shared_ptr<const std::vector<std::vector<float>>> dfCoeffs_;
 
     // method to read/mainupalate header info and data
     void read_eos_binary(std::string filepath,
-                         std::vector<float> &out, int header_size=12);
+                         FloatTable &out, int header_size=12);
     void read_dfCoeffs_binary(std::string filepath, const int dfType);
 
     void get_eos_max_values();

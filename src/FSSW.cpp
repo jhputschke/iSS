@@ -902,6 +902,10 @@ void FSSW::calculate_dN_dxtdy_for_species_block(
 
     // Every cell writes only its own dN_dxtdy elements, so the cells can be
     // done in parallel with the same arithmetic per cell as the serial loop.
+    long n_threads_outer = 1;
+#ifdef _OPENMP
+    n_threads_outer = omp_get_max_threads();
+#endif
     #pragma omp parallel
     {
     std::vector<double> visCoeffs_local;
@@ -922,8 +926,12 @@ void FSSW::calculate_dN_dxtdy_for_species_block(
     const bool by_block = (block_yield_out != nullptr);
     const long n_blocks = static_cast<long>(block_word_.size());
     const long n_outer = by_block ? n_blocks : FO_length;
-    // blocks: dynamic, as the cores of a machine may differ in speed
-    const long chunk = by_block ? 16 : 4096;
+    // blocks: dynamic, as the cores of a machine may differ in speed. Cells:
+    // 4096 per chunk on a large surface; a small one (time-stepped running)
+    // in about 4 chunks per thread, else one or two threads did all of it.
+    // (Which thread does a cell does not change its numbers.)
+    const long chunk = by_block ? 16
+        : std::max(64L, std::min(4096L, FO_length/(4L*n_threads_outer)));
     #pragma omp for schedule(dynamic, chunk)
     for (long ob = 0; ob < n_outer; ob++) {
     const long l_begin = by_block ? block_start_[ob] : ob;
@@ -1315,6 +1323,19 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
     // The species in blocks: one pass over the cells gives the yields of a
     // whole block, then its species are sampled one after the other, so the
     // random draws come in the same order as with one species at a time.
+    // Uncorrelated sampling of a surface whose yields of all species fit in
+    // kAllSpeciesBytes_: one block of all species, i.e. one pass and one
+    // parallel region per surface. Time-stepped running hands over thousands
+    // of small surfaces; with the passive OpenMP wait policy of the GPU builds
+    // every region wakes the threads (about 1.5 ms on a GB10), and 50 blocks
+    // of 8 species cost 75 ms per surface whatever its size. The yields are
+    // the same numbers either way (per cell and species the same arithmetic).
+    const bool all_species_at_once = (
+        !correlated_sampling_
+        && static_cast<double>(FO_length)*number_of_chosen_particles
+               *sizeof(double) <= kAllSpeciesBytes_);
+    const int species_block = (all_species_at_once
+                               ? number_of_chosen_particles : kSpeciesBlock_);
     std::vector<int> block_species, block_n;
     for (int n = 0; n < number_of_chosen_particles; n++) {
         int real_particle_idx = chosen_particles_sampling_table[n];
@@ -1330,7 +1351,7 @@ void FSSW::sample_using_dN_dxtdy_4all_particles_conventional() {
             block_n.push_back(n);
         }
         const bool block_full = (
-            static_cast<int>(block_species.size()) >= kSpeciesBlock_);
+            static_cast<int>(block_species.size()) >= species_block);
         if (block_species.empty()
             || (!block_full && n < number_of_chosen_particles - 1)) {
             continue;

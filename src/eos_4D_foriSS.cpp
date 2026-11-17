@@ -76,21 +76,32 @@ void EOS_4D_foriSS::read_header_binary(std::string filepath, int header_size) {
 
 
 void EOS_4D_foriSS::read_eos_binary(std::string filepath,
-                             std::vector<float> &out, int header_size) {
+                             FloatTable &out, int header_size) {
+    // the file's floats after the header, once per (file, header size)
+    static std::map<std::string, FloatTable> after_header;
+    const std::string key = filepath + "#" + std::to_string(header_size);
+    {
+        std::lock_guard<std::mutex> lock(table_cache_mutex);
+        auto it = after_header.find(key);
+        if (it != after_header.end()) { out = it->second; return; }
+    }
     auto data = cached_file_floats(filepath);
     if (!data) {
         messenger << "Can not open EOS file: "<< filepath;
         messenger.flush("error");
         exit(1);
     }
-    // the file's floats after the header
-    out.assign(data->begin() + std::min<size_t>(header_size, data->size()),
-               data->end());
+    auto table = std::make_shared<const std::vector<float>>(
+        data->begin() + std::min<size_t>(header_size, data->size()),
+        data->end());
+    std::lock_guard<std::mutex> lock(table_cache_mutex);
+    after_header[key] = table;
+    out = table;
 }
 
 
 void EOS_4D_foriSS::read_dfCoeffs_binary(std::string filepath, const int dfType) {
-    dfCoeffs_.clear();
+    dfCoeffs_.reset();
     int numCoeffs = 6;
     if (dfType == 1) {
         numCoeffs = 3;
@@ -123,7 +134,7 @@ void EOS_4D_foriSS::read_dfCoeffs_binary(std::string filepath, const int dfType)
         split[key] = c;
         coeffs = c;
     }
-    dfCoeffs_ = *coeffs;
+    dfCoeffs_ = coeffs;
 }
 
 
@@ -410,7 +421,7 @@ double EOS_4D_foriSS::get_temperature(double e, double rhob,
     std::array<float, 4> TildeVar{};
     get_tilde_variables(e, rhob, rhoq, rhos, TildeVar);
     std::array<float, 5> ResArr{};
-    FourDLInterp(temp_vec, TildeVar, ResArr);  // 1/fm
+    FourDLInterp(*temp_vec, TildeVar, ResArr);  // 1/fm
     return(std::max(1e-15, static_cast<double>(ResArr[0])));
 }
 
@@ -422,7 +433,7 @@ double EOS_4D_foriSS::get_pressure(double e, double rhob,
     std::array<float, 4> TildeVar{};
     get_tilde_variables(e, rhob, rhoq, rhos, TildeVar);
     std::array<float, 5> ResArr{};
-    FourDLInterp(pressure_vec, TildeVar, ResArr);
+    FourDLInterp(*pressure_vec, TildeVar, ResArr);
     return(std::max(1e-15, static_cast<double>(ResArr[0])));
 }
 
@@ -442,12 +453,12 @@ void EOS_4D_foriSS::getThermalVariables(const double epsilon, const double rhob,
 void EOS_4D_foriSS::getDeltafCoeffs(const double epsilon, const double rhob,
                              const double rhoq, const double rhos,
                              std::vector<double> &deltafVec) const {
-    deltafVec.resize(dfCoeffs_.size());
+    deltafVec.resize(dfCoeffs_->size());
     std::array<float, 4> TildeVar{};
     get_tilde_variables(epsilon, rhob, rhoq, rhos, TildeVar);
     std::array<float, 5> ResArr{};
-    for (unsigned int i = 0; i < dfCoeffs_.size(); ++i) {
-        FourDLInterp(dfCoeffs_[i], TildeVar, ResArr);
+    for (unsigned int i = 0; i < dfCoeffs_->size(); ++i) {
+        FourDLInterp((*dfCoeffs_)[i], TildeVar, ResArr);
         deltafVec[i] = static_cast<double>(ResArr[0]);
     }
 }
@@ -459,7 +470,7 @@ double EOS_4D_foriSS::get_muB(double e, double rhob, double rhoq, double rhos) c
     std::array<float, 4> TildeVar{};
     get_tilde_variables(e, rhob, rhoq, rhos, TildeVar);
     std::array<float, 5> ResArr{};
-    FourDLInterp(mub_vec, TildeVar, ResArr);  // 1/fm
+    FourDLInterp(*mub_vec, TildeVar, ResArr);  // 1/fm
     return(static_cast<double>(ResArr[0]));
 }
 
@@ -470,7 +481,7 @@ double EOS_4D_foriSS::get_muS(double e, double rhob, double rhoq, double rhos) c
     std::array<float, 4> TildeVar{};
     get_tilde_variables(e, rhob, rhoq, rhos, TildeVar);
     std::array<float, 5> ResArr{};
-    FourDLInterp(mus_vec, TildeVar, ResArr);  // 1/fm
+    FourDLInterp(*mus_vec, TildeVar, ResArr);  // 1/fm
     return(static_cast<double>(ResArr[0]));
 }
 
@@ -481,6 +492,6 @@ double EOS_4D_foriSS::get_muQ(double e, double rhob, double rhoq, double rhos) c
     std::array<float, 4> TildeVar{};
     get_tilde_variables(e, rhob, rhoq, rhos, TildeVar);
     std::array<float, 5> ResArr{};
-    FourDLInterp(muq_vec, TildeVar, ResArr);  // 1/fm
+    FourDLInterp(*muq_vec, TildeVar, ResArr);  // 1/fm
     return(static_cast<double>(ResArr[0]));
 }
